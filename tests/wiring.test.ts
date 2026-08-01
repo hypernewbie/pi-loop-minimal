@@ -6,7 +6,10 @@ import type { LoopState } from "../src/state.ts";
 type ToolParams = { status: "next" | "done"; summary: string; reason?: string };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: LoopState };
 type CommandCtx = ExtensionContext & { waitForIdle(): Promise<void> };
-type CommandDef = { handler: (args: string, ctx: CommandCtx) => Promise<void> };
+type CommandDef = {
+	handler: (args: string, ctx: CommandCtx) => Promise<void>;
+	getArgumentCompletions?: (prefix: string) => unknown[] | null;
+};
 type ShortcutDef = { handler: (ctx: ExtensionContext) => Promise<void> };
 type ToolDef = {
 	name: string;
@@ -101,6 +104,25 @@ describe("extension surface", () => {
 		expect(h.handlers.has("session_switch")).toBe(false);
 		expect(h.handlers.has("session_fork")).toBe(false);
 		expect(h.handlers.has("agent_end")).toBe(false);
+	});
+});
+
+describe("/loop completions", () => {
+	it("offers the goal completion only while the prefix matches", () => {
+		const h = createHarness();
+		const completions = loopCmd(h).getArgumentCompletions!;
+		expect(completions("goal")).toHaveLength(1);
+		expect(completions("go")).toHaveLength(1);
+		expect(completions("")).toHaveLength(1);
+	});
+
+	it("never offers the completion while a goal is being typed", () => {
+		const h = createHarness();
+		const completions = loopCmd(h).getArgumentCompletions!;
+		// typing "hello" as the goal must not show a completion that would
+		// replace it on accept
+		expect(completions("hello")).toBeNull();
+		expect(completions("my goal text")).toBeNull();
 	});
 });
 
