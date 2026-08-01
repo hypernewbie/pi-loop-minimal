@@ -146,12 +146,13 @@ export function renderLoopControlResult(
 	const d = result.details as LoopState | undefined;
 	if (!d) return new Text("", 0, 0);
 	const t = theme as { fg: (color: string, text: string) => string };
-	return new Text(
-		t.fg(
-			d.done ? "success" : "accent",
-			`${d.done ? "✓" : "→"} step ${d.currentStep + 1} — ${d.mode}`,
-		),
-		0,
-		0,
-	);
+	// currentStep is the number of iterations already completed (0-based
+	// index of the iteration that just finished), so "next" shows the pass
+	// that just completed while the widget shows the one now running.
+	const label = d.done
+		? "✓ loop complete"
+		: d.mode === "passes"
+			? `→ pass ${d.currentStep}/${d.maxSteps}`
+			: `→ iter ${d.currentStep}`;
+	return new Text(t.fg(d.done ? "success" : "accent", label), 0, 0);
 }

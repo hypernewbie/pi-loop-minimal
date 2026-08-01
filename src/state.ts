@@ -98,7 +98,9 @@ export function parsePassesArgs(parts: string[]): LoopState | string {
 	};
 }
 
-// Widget update logic
+// Widget update logic — compact two-line widget, no box, no emoji.
+// Status (footer) carries the compact loop label; the widget above the
+// editor shows the label plus the goal and the stop hint.
 export function updateWidget(state: LoopState, ctx: ExtensionContext) {
 	if (!state.active) {
 		ctx.ui.setStatus("loop", undefined);
@@ -109,14 +111,12 @@ export function updateWidget(state: LoopState, ctx: ExtensionContext) {
 	const label =
 		state.mode === "passes"
 			? `pass ${state.currentStep + 1}/${state.maxSteps}`
-			: `iteration ${state.currentStep + 1} (until goal met)`;
+			: `iter ${state.currentStep + 1}`;
 
-	ctx.ui.setStatus("loop", `🔄 ${label}`);
+	ctx.ui.setStatus("loop", `loop · ${label}`);
 	ctx.ui.setWidget("loop", [
-		`┌─ Loop: ${state.mode} ──────────`,
-		`│ ${state.goal}`,
-		`│ ${label}`,
-		`└─ Ctrl+Shift+X to stop ────────`,
+		`${label} · ${state.goal}`,
+		"Ctrl+Shift+X to stop",
 	]);
 }
 
