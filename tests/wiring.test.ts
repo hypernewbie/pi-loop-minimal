@@ -98,12 +98,16 @@ describe("extension surface", () => {
 
 	it("listens only to current-Pi events", () => {
 		const h = createHarness();
-		for (const ev of ["session_start", "session_tree", "before_agent_start"]) {
+		for (const ev of [
+			"session_start",
+			"session_tree",
+			"before_agent_start",
+			"agent_end",
+		]) {
 			expect(h.handlers.has(ev), ev).toBe(true);
 		}
 		expect(h.handlers.has("session_switch")).toBe(false);
 		expect(h.handlers.has("session_fork")).toBe(false);
-		expect(h.handlers.has("agent_end")).toBe(false);
 	});
 });
 
@@ -280,6 +284,112 @@ describe("stop controls", () => {
 		const h = createHarness();
 		await shortcut(h).handler(h.ctx);
 		expect(h.ctx.abort).not.toHaveBeenCalled();
+	});
+});
+
+describe("force-close: agent_end nudge", () => {
+	const agentEnd = (h: Harness, messages: unknown[] = []) =>
+		h.handlers.get("agent_end")!({ messages }, h.ctx);
+
+	it("nudges a run that ended with the loop still open", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal keep going", h.ctx);
+		await agentEnd(h, [
+			{ role: "assistant", stopReason: "stop" },
+		]);
+		expect(h.sentMessages).toHaveLength(1);
+		expect(h.sentMessages[0].msg).toMatchObject({
+			customType: "loop-nudge",
+			display: false,
+		});
+		expect(h.sentMessages[0].msg.content).toContain("Continue working");
+		expect(h.sentMessages[0].opts).toEqual({
+			triggerTurn: true,
+			deliverAs: "steer",
+		});
+	});
+
+	it("does not nudge after loop_control completed the loop", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal done now", h.ctx);
+		await execTool(h, { status: "done", summary: "finished" });
+		await agentEnd(h, [{ role: "assistant", stopReason: "stop" }]);
+		expect(h.sentMessages).toHaveLength(0);
+	});
+
+	it("does not nudge after /loop-stop", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal stop soon", h.ctx);
+		await stopCmd(h).handler("", h.ctx);
+		await agentEnd(h, [{ role: "assistant", stopReason: "stop" }]);
+		expect(h.sentMessages).toHaveLength(0);
+	});
+
+	it("never nudges an aborted run", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal abort me", h.ctx);
+		await agentEnd(h, [{ role: "assistant", stopReason: "aborted" }]);
+		expect(h.sentMessages).toHaveLength(0);
+	});
+
+	it("never nudges an errored run", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal error me", h.ctx);
+		await agentEnd(h, [{ role: "assistant", stopReason: "error" }]);
+		expect(h.sentMessages).toHaveLength(0);
+	});
+
+	it("nudges when the run ends on a tool result (no stopReason)", async () => {
+		// a terminating tool batch can end a run with a toolResult last; the
+		// loop is still open and the user did not abort -> nudge fires
+		const h = createHarness();
+		await loopCmd(h).handler("goal tool ended", h.ctx);
+		await agentEnd(h, [{ role: "toolResult", toolName: "other" }]);
+		expect(h.sentMessages).toHaveLength(1);
+		expect(h.sentMessages[0].msg.customType).toBe("loop-nudge");
+	});
+
+	it("re-arms after next, so a second bug-end is nudged again", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("2 two passes", h.ctx);
+		await execTool(h, { status: "next", summary: "pass one done" });
+		// model ends the second pass without calling loop_control
+		await agentEnd(h, [{ role: "assistant", stopReason: "stop" }]);
+		const nudges = h.sentMessages.filter(
+			(m) => m.msg.customType === "loop-nudge",
+		);
+		expect(nudges).toHaveLength(1);
+		expect(nudges[0].msg.content).toContain("pass 2/2");
+	});
+
+	it("nudges after reconstruction of an active loop", async () => {
+		const h = createHarness();
+		h.branch.push({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "loop_control",
+				details: {
+					active: true,
+					mode: "goal",
+					currentStep: 3,
+					maxSteps: null,
+					goal: "restored",
+					done: false,
+					reasonDone: "",
+				},
+			},
+		});
+		await h.handlers.get("session_start")!({}, h.ctx);
+		await agentEnd(h, [{ role: "assistant", stopReason: "stop" }]);
+		expect(h.sentMessages).toHaveLength(1);
+		expect(h.sentMessages[0].msg.content).toContain("iteration 4");
+	});
+
+	it("is silent when no loop is active", async () => {
+		const h = createHarness();
+		await agentEnd(h, [{ role: "assistant", stopReason: "stop" }]);
+		expect(h.sentMessages).toHaveLength(0);
 	});
 });
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	buildNudgePrompt,
 	buildPrompt,
 	emptyState,
 	getSystemPromptAddition,
@@ -124,6 +125,22 @@ describe("buildPrompt", () => {
 	it("advances the iteration number with currentStep", () => {
 		const p = buildPrompt(goalState(4));
 		expect(p).toContain("## Loop — Iteration 5");
+	});
+});
+
+describe("buildNudgePrompt", () => {
+	it("tells the model to continue working without mentioning loop_control", () => {
+		const p = buildNudgePrompt(goalState());
+		expect(p).toContain("The loop is still active");
+		expect(p).toContain("iteration 1");
+		expect(p).toContain("Continue working on: green tests");
+		expect(p).toContain("Do not end your turn");
+		expect(p).not.toContain("loop_control");
+	});
+
+	it("labels count-mode nudges with the pass number", () => {
+		const p = buildNudgePrompt(countState(2, 5));
+		expect(p).toContain("pass 3/5");
 	});
 });
 

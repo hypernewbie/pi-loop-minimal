@@ -8,8 +8,9 @@
 //
 // Ported from pi-agent-loop@0.1.1 (MIT). Changes from the original:
 // the `passes`/`pipeline` modes and the dead `session_switch`/`session_fork`
-// events are removed, the no-op `agent_end` handler is dropped, and the
-// `/loop` command now takes `<N>` directly instead of `passes <N>`.
+// events are removed, the no-op `agent_end` handler was replaced by the
+// force-close nudge below, and the `/loop` command now takes `<N>`
+// directly instead of `passes <N>`.
 
 import type {
 	ExtensionAPI,
@@ -17,6 +18,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import {
+	buildNudgePrompt,
 	buildPrompt,
 	emptyState,
 	getSystemPromptAddition,
@@ -34,6 +36,10 @@ import {
 
 export default function (pi: ExtensionAPI) {
 	let state = emptyState();
+	// Runtime-only: true while the current iteration expects loop_control.
+	// Set when an iteration is dispatched, cleared when loop_control runs;
+	// used by agent_end to detect a turn that ended without closing the loop.
+	let awaitingControl = false;
 
 	// ── Reconstruct state from session branch ────────────────────────────
 	const reconstruct = (ctx: ExtensionContext) => {
@@ -46,10 +52,37 @@ export default function (pi: ExtensionAPI) {
 				if (d) state = { ...d };
 			}
 		}
+		// A restored active loop was mid-iteration when the session ended:
+		// its iteration still expects loop_control.
+		awaitingControl = state.active;
 	};
 
 	pi.on("session_start", async (_e, ctx) => reconstruct(ctx));
 	pi.on("session_tree", async (_e, ctx) => reconstruct(ctx));
+
+	// ── Force-close: nudge a run that ended with the loop still open ────
+	pi.on("agent_end", async (event, _ctx) => {
+		if (!state.active || !awaitingControl) return;
+		// Never restart a run the user aborted or one that errored: Pi ends
+		// those with a final message carrying stopReason "aborted"/"error".
+		const last = event.messages.at(-1);
+		// Pi's stream contract ends aborted/errored runs with a final
+		// AssistantMessage carrying stopReason "aborted"/"error"; the
+		// AgentMessage type does not expose it, so narrow via a cast.
+		const stopReason =
+			last?.role === "assistant"
+				? (last as { stopReason?: string }).stopReason
+				: undefined;
+		if (stopReason === "aborted" || stopReason === "error") return;
+		pi.sendMessage(
+			{
+				customType: "loop-nudge",
+				content: buildNudgePrompt(state),
+				display: false,
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	});
 
 	// ── Tool: the LLM calls this to signal progress ─────────────────────
 	pi.registerTool({
@@ -57,6 +90,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const result = handleLoopControlTool(params, state, pi, ctx);
 			state = result.newState;
+			// Re-arm for the next iteration; an inactive loop has nothing to
+			// await, so a later agent_end stays silent.
+			awaitingControl = result.newState.active;
 			updateWidget(state, ctx);
 			return {
 				content: result.content,
@@ -128,6 +164,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			state = result;
+			awaitingControl = true;
 			updateWidget(state, ctx);
 			// Kick off the first iteration
 			pi.sendUserMessage(buildPrompt(state));
@@ -145,6 +182,7 @@ export default function (pi: ExtensionAPI) {
 			state.active = false;
 			state.done = true;
 			state.reasonDone = "Stopped by user";
+			awaitingControl = false;
 			updateWidget(state, ctx);
 			ctx.ui.notify(
 				`Loop stopped after ${state.currentStep + 1} iteration(s)`,
@@ -161,6 +199,7 @@ export default function (pi: ExtensionAPI) {
 			state.active = false;
 			state.done = true;
 			state.reasonDone = "Stopped by shortcut";
+			awaitingControl = false;
 			updateWidget(state, ctx);
 			ctx.abort(); // also abort the current LLM turn
 			ctx.ui.notify("Loop aborted", "warning");

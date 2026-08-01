@@ -98,6 +98,22 @@ export function parsePassesArgs(parts: string[]): LoopState | string {
 	};
 }
 
+// Steer message sent when the model ends its turn with the loop still
+// open. It tells the model to keep working — not to call loop_control —
+// because a turn that ends without closing the loop is usually a bug-end,
+// not a deliberate completion.
+export function buildNudgePrompt(state: LoopState): string {
+	const label =
+		state.mode === "passes"
+			? `pass ${state.currentStep + 1}/${state.maxSteps}`
+			: `iteration ${state.currentStep + 1}`;
+	return [
+		`The loop is still active — you ended your turn before finishing ${label}.`,
+		`Continue working on: ${state.goal}`,
+		"Do not end your turn until this iteration is complete.",
+	].join("\n");
+}
+
 // Widget update logic — compact two-line widget, no box, no emoji.
 // Status (footer) carries the compact loop label; the widget above the
 // editor shows the label plus the goal and the stop hint.

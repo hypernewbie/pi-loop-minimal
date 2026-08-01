@@ -17,8 +17,10 @@ matter.
 - **Same signal contract**: the model steers each iteration by calling the
   `loop_control` tool with `status: "next"` or `status: "done"`; the next
   iteration is steered with the same iteration prompt shape as the original.
-- **Compact status**: a two-line widget and a footer status — no box, no
-  emoji.
+- **Forced closure**: if the model ends its turn with the loop still open,
+  the loop immediately steers it to continue working (`triggerTurn`), so a
+  bug-ended turn cannot silently stall the loop. Runs the user aborted
+  (`Esc`) or that errored are never restarted.
 - **Session continuity**: state is reconstructed from the last `loop_control`
   result on session start and on `/tree` navigation, like the original.
 
@@ -90,6 +92,9 @@ mode). Tool results render as `→ pass 2/5`, `→ iter 3`, or `✓ loop complet
   `maxSteps: null` and treats `null` as unbounded.
 - **Tighter count parsing**: `/loop 3abc …` is rejected instead of being
   accepted as 3 via `parseInt` slop.
+- **Force-close nudge**: new `agent_end` behavior — a run that ends while
+  the loop is still open is steered with a "continue working" message
+  (never after abort/error). The original just went silent.
 
 Everything model-facing — iteration prompts, the `loop_control` schema and
 its descriptions, the system-prompt addition, the completion texts — is
@@ -100,7 +105,7 @@ the tool description with the pipeline removal.
 
 ```bash
 npm install
-npm test          # vitest — 72 tests
+npm test          # vitest — 84 tests
 npm run typecheck # tsc --noEmit (src + tests)
 npm pack --dry-run
 ```
