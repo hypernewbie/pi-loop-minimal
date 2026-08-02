@@ -31,6 +31,8 @@ describe("handleLoopControlTool — no active loop", () => {
 			goal: "",
 			done: false,
 			reasonDone: "",
+			judgeModel: null,
+			denials: 0,
 		};
 		const r = handleLoopControlTool(
 			{ status: "next", summary: "x" },

@@ -5,11 +5,19 @@ import {
 	emptyState,
 	getSystemPromptAddition,
 	parseGoalArgs,
+	parseJudgedArgs,
 	parsePassesArgs,
 	updateWidget,
 } from "../src/state.ts";
 import type { LoopState } from "../src/state.ts";
-import { captureUi, countState, goalState, parseOk } from "./helpers.ts";
+import {
+	captureUi,
+	countState,
+	fakeRegistry,
+	goalState,
+	judgedState,
+	parseOk,
+} from "./helpers.ts";
 
 describe("emptyState", () => {
 	it("is inactive with a zeroed goal-mode shape", () => {
@@ -21,6 +29,8 @@ describe("emptyState", () => {
 			goal: "",
 			done: false,
 			reasonDone: "",
+			judgeModel: null,
+			denials: 0,
 		});
 	});
 });
@@ -198,3 +208,107 @@ describe("updateWidget", () => {
 
 // keep LoopState referenced for type-level completeness of helpers
 export type { LoopState };
+
+describe("parseJudgedArgs — entry validation", () => {
+	const reg = fakeRegistry();
+	const parse = (line: string) =>
+		parseJudgedArgs(line.trim().split(/\s+/), reg);
+
+	it("accepts a valid slug and keeps the rest as the goal", () => {
+		const s = parseOk(
+			parse("goal_judged minimax/MiniMax-M3 hi do something here"),
+		);
+		expect(s).toMatchObject({
+			active: true,
+			mode: "goal",
+			maxSteps: null,
+			goal: "hi do something here",
+			judgeModel: "minimax/MiniMax-M3",
+			denials: 0,
+		});
+	});
+
+	it("keeps goal mode so passes-mode branches stay untouched", () => {
+		expect(parseOk(parse("goal_judged m3/MiniMax-M3 x")).mode).toBe("goal");
+	});
+
+	it("requires a judge model", () => {
+		expect(parse("goal_judged")).toBe(
+			"Provide a judge model: /loop goal_judged <provider/model> <goal>",
+		);
+	});
+
+	it("requires provider/id form", () => {
+		expect(parse("goal_judged MiniMax-M3 do it")).toBe(
+			'Judge model must be provider/id (got "MiniMax-M3")',
+		);
+		expect(parse("goal_judged /MiniMax-M3 do it")).toBe(
+			'Judge model must be provider/id (got "/MiniMax-M3")',
+		);
+		expect(parse("goal_judged minimax/ do it")).toBe(
+			'Judge model must be provider/id (got "minimax/")',
+		);
+	});
+
+	it("rejects an unknown model", () => {
+		expect(parse("goal_judged nope/whatever do it")).toBe(
+			"Unknown judge model: nope/whatever",
+		);
+	});
+
+	it("rejects a model whose provider has no auth", () => {
+		const r = fakeRegistry({ unauthed: ["m3/MiniMax-M3"] });
+		expect(parseJudgedArgs("goal_judged m3/MiniMax-M3 do it".split(" "), r)).toBe(
+			'No auth configured for provider "m3"',
+		);
+	});
+
+	it("requires a goal description after the slug", () => {
+		expect(parse("goal_judged minimax/MiniMax-M3")).toBe(
+			"Provide a goal description",
+		);
+	});
+
+	it("keeps slashes inside the model id", () => {
+		const r = fakeRegistry({ known: ["openrouter/openai/gpt-5"] });
+		const s = parseOk(
+			parseJudgedArgs("goal_judged openrouter/openai/gpt-5 ship".split(" "), r),
+		);
+		expect(s.judgeModel).toBe("openrouter/openai/gpt-5");
+	});
+
+	it("leaves plain goal and passes loops unjudged", () => {
+		expect(parseOk(parseGoalArgs(["goal", "x"])).judgeModel).toBeNull();
+		expect(parseOk(parsePassesArgs(["3", "x"])).judgeModel).toBeNull();
+		expect(parseOk(parsePassesArgs(["3", "x"])).denials).toBe(0);
+	});
+});
+
+describe("judged UX surfaces", () => {
+	it("shows the denial count in widget and status once denied", () => {
+		const u = captureUi();
+		updateWidget(judgedState(2, 3), u.ctx);
+		expect(u.status).toBe("loop · iter 3 · denied 3");
+		expect(u.widget).toEqual([
+			"iter 3 · denied 3 · green tests",
+			"Ctrl+Shift+X to stop",
+		]);
+	});
+
+	it("hides the denial segment at zero", () => {
+		const u = captureUi();
+		updateWidget(judgedState(0, 0), u.ctx);
+		expect(u.status).toBe("loop · iter 1");
+		expect((u.widget as string[])[0]).toBe("iter 1 · green tests");
+	});
+
+	it("tells the model its completion is judged", () => {
+		const p = getSystemPromptAddition(judgedState());
+		expect(p).toContain("reviewed by an independent judge (minimax/MiniMax-M3)");
+		expect(p).toContain("is rejected and you must keep working");
+	});
+
+	it("says nothing about a judge in an unjudged loop", () => {
+		expect(getSystemPromptAddition(goalState())).not.toContain("judge");
+	});
+});

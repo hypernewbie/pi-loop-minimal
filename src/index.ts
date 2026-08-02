@@ -24,6 +24,7 @@ import {
 	getSystemPromptAddition,
 	type LoopState,
 	parseGoalArgs,
+	parseJudgedArgs,
 	parsePassesArgs,
 	updateWidget,
 } from "./state.js";
@@ -48,8 +49,10 @@ export default function (pi: ExtensionAPI) {
 			if (entry.type !== "message") continue;
 			const msg = entry.message;
 			if (msg.role === "toolResult" && msg.toolName === "loop_control") {
-				const d = msg.details as LoopState | undefined;
-				if (d) state = { ...d };
+				const d = msg.details as Partial<LoopState> | undefined;
+				// Spread over defaults: details recorded before a field existed
+				// would otherwise restore as undefined (denials + 1 => NaN).
+				if (d) state = { ...emptyState(), ...d };
 			}
 		}
 		// A restored active loop was mid-iteration when the session ended:
@@ -114,17 +117,25 @@ export default function (pi: ExtensionAPI) {
 	// ── /loop command — start a loop ─────────────────────────────────────
 	pi.registerCommand("loop", {
 		description:
-			"Start a loop. Usage: /loop goal <desc> | /loop <N> <task>",
+			"Start a loop. Usage: /loop goal <desc> | /loop goal_judged <provider/model> <desc> | /loop <N> <task>",
 		getArgumentCompletions: (prefix: string) => {
 			// Filter by the current argument: once the user types the goal
 			// text, the completion must disappear so accepting it cannot
 			// replace what they typed (AutocompleteItem.value replaces the
 			// whole current argument).
+			// No completions are offered for the judge model slug: accepting an
+			// argument completion replaces the whole argument and does not submit,
+			// which is the /model footgun. Mode keywords only.
 			const items = [
 				{
 					value: "goal ",
 					label: "goal <description>",
 					description: "Loop until goal is met",
+				},
+				{
+					value: "goal_judged ",
+					label: "goal_judged <provider/model> <description>",
+					description: "Loop until an independent judge agrees",
 				},
 			];
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
@@ -133,7 +144,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!args?.trim()) {
 				ctx.ui.notify(
-					"Usage:\n  /loop goal <description>\n  /loop <N> <task>",
+					"Usage:\n  /loop goal <description>\n  /loop goal_judged <provider/model> <description>\n  /loop <N> <task>",
 					"info",
 				);
 				return;
@@ -148,11 +159,13 @@ export default function (pi: ExtensionAPI) {
 
 			if (mode === "goal") {
 				result = parseGoalArgs(parts);
+			} else if (mode === "goal_judged") {
+				result = parseJudgedArgs(parts, ctx.modelRegistry);
 			} else if (/^\d+$/.test(mode)) {
 				result = parsePassesArgs(parts);
 			} else {
 				ctx.ui.notify(
-					`Unknown mode "${mode}". Use: goal, or <N> for an exact-count loop`,
+					`Unknown mode "${mode}". Use: goal, goal_judged, or <N> for an exact-count loop`,
 					"error",
 				);
 				return;
