@@ -17,6 +17,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
+import { type JudgeResult, runJudge } from "./judge.js";
 import {
 	buildNudgePrompt,
 	buildPrompt,
@@ -90,8 +91,22 @@ export default function (pi: ExtensionAPI) {
 	// ── Tool: the LLM calls this to signal progress ─────────────────────
 	pi.registerTool({
 		...getLoopControlToolDefinition(),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const result = handleLoopControlTool(params, state, pi, ctx);
+		async execute(_id, params, signal, onUpdate, ctx) {
+			// A judged loop must clear an independent review before it may close.
+			let judge: JudgeResult | undefined;
+			if (state.active && state.judgeModel && params.status === "done") {
+				onUpdate?.({
+					content: [
+						{ type: "text", text: `judging with ${state.judgeModel}…` },
+					],
+					details: undefined,
+				});
+				judge = await runJudge(state, params, ctx, signal);
+			}
+			// state is re-read after the await on purpose: /loop-stop or
+			// Ctrl+Shift+X during the review deactivates the loop, and the
+			// handler's inactive branch then applies.
+			const result = handleLoopControlTool(params, state, pi, ctx, judge);
 			state = result.newState;
 			// Re-arm for the next iteration; an inactive loop has nothing to
 			// await, so a later agent_end stays silent.
@@ -100,6 +115,9 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: result.content,
 				details: result.details,
+				...(judge?.kind === "verdict" && judge.usage
+					? { usage: judge.usage }
+					: {}),
 			};
 		},
 		renderCall: renderLoopControlCall,

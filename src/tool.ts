@@ -13,6 +13,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import type { JudgeResult } from "./judge.js";
 import { buildPrompt, type LoopState } from "./state.js";
 
 export function handleLoopControlTool(
@@ -20,6 +21,8 @@ export function handleLoopControlTool(
 	state: LoopState,
 	pi: ExtensionAPI,
 	_ctx: ExtensionContext,
+	// Judge outcome for a judged loop's "done"; undefined when unjudged.
+	judge?: JudgeResult,
 ): {
 	content: { type: "text"; text: string }[];
 	details: LoopState | undefined;
@@ -36,17 +39,62 @@ export function handleLoopControlTool(
 	}
 
 	if (params.status === "done") {
+		// A user abort during review must not close the loop, and must not be
+		// mistaken for a judgement either way.
+		if (judge?.kind === "aborted") {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Judge review aborted. The loop is still active — nothing was accepted.",
+					},
+				],
+				details: { ...state } as LoopState,
+				newState: state,
+			};
+		}
+
+		// Denied: the loop stays open at the same iteration and the model is
+		// told what is missing. The tool result lands mid-turn, so the model
+		// simply keeps working; if it ends its turn instead, the agent_end
+		// nudge catches it.
+		if (judge?.kind === "verdict" && !judge.pass) {
+			const newState = { ...state, denials: state.denials + 1 };
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`✗ DENIED by judge (attempt ${newState.denials}). The goal is not met.`,
+							judge.reasons ? `Not met: ${judge.reasons}` : "",
+							'Keep working. Do not call loop_control with "done" again until this is addressed.',
+						]
+							.filter(Boolean)
+							.join("\n"),
+					},
+				],
+				details: { ...newState } as LoopState,
+				newState,
+			};
+		}
+
 		const newState = {
 			...state,
 			done: true,
 			reasonDone: params.reason ?? params.summary,
 			active: false,
 		};
+		const judged =
+			judge?.kind === "verdict"
+				? " Judge: passed."
+				: judge?.kind === "unavailable"
+					? ` (judge unavailable: ${judge.note})`
+					: "";
 		return {
 			content: [
 				{
 					type: "text",
-					text: `✓ Loop complete after ${state.currentStep + 1} iteration(s). Reason: ${newState.reasonDone}`,
+					text: `✓ Loop complete after ${state.currentStep + 1} iteration(s). Reason: ${newState.reasonDone}${judged}`,
 				},
 			],
 			details: { ...newState } as LoopState,
@@ -149,6 +197,9 @@ export function renderLoopControlResult(
 	// currentStep is the number of iterations already completed (0-based
 	// index of the iteration that just finished), so "next" shows the pass
 	// that just completed while the widget shows the one now running.
+	if (d.denials > 0 && !d.done) {
+		return new Text(t.fg("error", `✗ denied by judge (${d.denials})`), 0, 0);
+	}
 	const label = d.done
 		? "✓ loop complete"
 		: d.mode === "passes"

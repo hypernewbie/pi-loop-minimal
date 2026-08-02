@@ -319,6 +319,11 @@ describe("reconstruction defaults", () => {
 		// the restored loop still nudges, proving active survived the merge
 		expect(h.sentMessages).toHaveLength(1);
 		expect(h.sentMessages[0].msg.content).toContain("iteration 3");
+		// and the missing counter defaulted to 0 rather than undefined/NaN
+		const tool = h.toolDefs[0];
+		const res = (await tool.execute("1", { status: "next", summary: "s" }, undefined, vi.fn(), h.ctx)) as { details: { denials: number } };
+		expect(res.details.denials).toBe(0);
+		expect(Number.isNaN(res.details.denials)).toBe(false);
 	});
 });
 
