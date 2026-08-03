@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	getLoopControlToolDefinition,
@@ -6,8 +6,8 @@ import {
 	renderLoopControlCall,
 	renderLoopControlResult,
 } from "../src/tool.ts";
-import { emptyState, type LoopState } from "../src/state.ts";
-import { countState, goalState, judgedState } from "./helpers.ts";
+import type { LoopState } from "../src/state.ts";
+import { countState, goalState } from "./helpers.ts";
 
 type ToolParams = { status: "next" | "done"; summary: string; reason?: string };
 
@@ -31,8 +31,6 @@ describe("handleLoopControlTool — no active loop", () => {
 			goal: "",
 			done: false,
 			reasonDone: "",
-			judgeModel: null,
-			denials: 0,
 		};
 		const r = handleLoopControlTool(
 			{ status: "next", summary: "x" },
@@ -279,118 +277,3 @@ describe("renderers", () => {
 });
 
 export type { ToolParams };
-
-describe("judged completion", () => {
-	const claim = { status: "done" as const, summary: "all done", reason: "shipped" };
-	const pi = { sendMessage: vi.fn(), sendUserMessage: vi.fn() } as never;
-	const ctx = {} as never;
-
-	it("denies a rejected completion and keeps the loop active", () => {
-		const r = handleLoopControlTool(claim, judgedState(2), pi, ctx, {
-			kind: "verdict",
-			pass: false,
-			reasons: "no tests were run",
-		});
-		expect(r.newState.active).toBe(true);
-		expect(r.newState.done).toBe(false);
-		expect(r.newState.denials).toBe(1);
-		// same iteration: a denial is a rejected attempt, not progress
-		expect(r.newState.currentStep).toBe(2);
-		const text = r.content[0].text;
-		expect(text).toContain("✗ DENIED by judge (attempt 1)");
-		expect(text).toContain("Not met: no tests were run");
-		expect(text).toContain("Keep working");
-	});
-
-	it("counts repeated denials", () => {
-		const r = handleLoopControlTool(claim, judgedState(0, 4), pi, ctx, {
-			kind: "verdict",
-			pass: false,
-			reasons: "still nothing",
-		});
-		expect(r.newState.denials).toBe(5);
-		expect(r.content[0].text).toContain("attempt 5");
-	});
-
-	it("omits the reason line when the judge gave none", () => {
-		const r = handleLoopControlTool(claim, judgedState(), pi, ctx, {
-			kind: "verdict",
-			pass: false,
-			reasons: "",
-		});
-		expect(r.content[0].text).not.toContain("Not met:");
-	});
-
-	it("persists denials in details for reconstruction", () => {
-		const r = handleLoopControlTool(claim, judgedState(1, 2), pi, ctx, {
-			kind: "verdict",
-			pass: false,
-			reasons: "x",
-		});
-		expect(r.details).toMatchObject({ denials: 3, active: true, judgeModel: "minimax/MiniMax-M3" });
-		expect(JSON.parse(JSON.stringify(r.details))).toMatchObject({ denials: 3 });
-	});
-
-	it("completes the loop when the judge passes", () => {
-		const r = handleLoopControlTool(claim, judgedState(1), pi, ctx, {
-			kind: "verdict",
-			pass: true,
-			reasons: "goal met",
-		});
-		expect(r.newState.active).toBe(false);
-		expect(r.newState.done).toBe(true);
-		expect(r.content[0].text).toContain("✓ Loop complete after 2 iteration(s)");
-		expect(r.content[0].text).toContain("Judge: passed.");
-	});
-
-	it("fails open when the judge is unavailable", () => {
-		const r = handleLoopControlTool(claim, judgedState(), pi, ctx, {
-			kind: "unavailable",
-			note: "429",
-		});
-		expect(r.newState.active).toBe(false);
-		expect(r.newState.done).toBe(true);
-		expect(r.content[0].text).toContain("(judge unavailable: 429)");
-	});
-
-	it("neither accepts nor closes on abort", () => {
-		const state = judgedState(3, 1);
-		const r = handleLoopControlTool(claim, state, pi, ctx, { kind: "aborted" });
-		expect(r.newState).toEqual(state);
-		expect(r.newState.active).toBe(true);
-		expect(r.newState.done).toBe(false);
-		expect(r.newState.denials).toBe(1);
-		expect(r.content[0].text).toContain("Judge review aborted");
-	});
-
-	it("never denies a 'next' — only completion is judged", () => {
-		const r = handleLoopControlTool(
-			{ status: "next", summary: "step done" },
-			judgedState(0),
-			pi,
-			ctx,
-			{ kind: "verdict", pass: false, reasons: "irrelevant" },
-		);
-		expect(r.newState.currentStep).toBe(1);
-		expect(r.newState.denials).toBe(0);
-		expect(r.content[0].text).toContain("→ Advancing");
-	});
-
-	it("closes unjudged loops exactly as before", () => {
-		const r = handleLoopControlTool(claim, goalState(0), pi, ctx);
-		expect(r.newState.done).toBe(true);
-		expect(r.content[0].text).toBe(
-			"✓ Loop complete after 1 iteration(s). Reason: shipped",
-		);
-	});
-
-	it("ignores a verdict when the loop is already inactive", () => {
-		const r = handleLoopControlTool(claim, emptyState(), pi, ctx, {
-			kind: "verdict",
-			pass: false,
-			reasons: "x",
-		});
-		expect(r.content[0].text).toContain("No active loop");
-		expect(r.newState.denials).toBe(0);
-	});
-});

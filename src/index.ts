@@ -17,7 +17,6 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
-import { type JudgeResult, runJudge } from "./judge.js";
 import {
 	buildNudgePrompt,
 	buildPrompt,
@@ -25,7 +24,6 @@ import {
 	getSystemPromptAddition,
 	type LoopState,
 	parseGoalArgs,
-	parseJudgedArgs,
 	parsePassesArgs,
 	updateWidget,
 } from "./state.js";
@@ -51,8 +49,9 @@ export default function (pi: ExtensionAPI) {
 			const msg = entry.message;
 			if (msg.role === "toolResult" && msg.toolName === "loop_control") {
 				const d = msg.details as Partial<LoopState> | undefined;
-				// Spread over defaults: details recorded before a field existed
-				// would otherwise restore as undefined (denials + 1 => NaN).
+				// Spread over defaults: details written by an older version can be
+				// missing fields, and restoring them as undefined turns arithmetic
+				// on them into NaN (the same trap as Infinity -> null for maxSteps).
 				if (d) state = { ...emptyState(), ...d };
 			}
 		}
@@ -91,22 +90,8 @@ export default function (pi: ExtensionAPI) {
 	// ── Tool: the LLM calls this to signal progress ─────────────────────
 	pi.registerTool({
 		...getLoopControlToolDefinition(),
-		async execute(_id, params, signal, onUpdate, ctx) {
-			// A judged loop must clear an independent review before it may close.
-			let judge: JudgeResult | undefined;
-			if (state.active && state.judgeModel && params.status === "done") {
-				onUpdate?.({
-					content: [
-						{ type: "text", text: `judging with ${state.judgeModel}…` },
-					],
-					details: undefined,
-				});
-				judge = await runJudge(state, params, ctx, signal);
-			}
-			// state is re-read after the await on purpose: /loop-stop or
-			// Ctrl+Shift+X during the review deactivates the loop, and the
-			// handler's inactive branch then applies.
-			const result = handleLoopControlTool(params, state, pi, ctx, judge);
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const result = handleLoopControlTool(params, state, pi, ctx);
 			state = result.newState;
 			// Re-arm for the next iteration; an inactive loop has nothing to
 			// await, so a later agent_end stays silent.
@@ -115,9 +100,6 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: result.content,
 				details: result.details,
-				...(judge?.kind === "verdict" && judge.usage
-					? { usage: judge.usage }
-					: {}),
 			};
 		},
 		renderCall: renderLoopControlCall,
@@ -135,25 +117,17 @@ export default function (pi: ExtensionAPI) {
 	// ── /loop command — start a loop ─────────────────────────────────────
 	pi.registerCommand("loop", {
 		description:
-			"Start a loop. Usage: /loop goal <desc> | /loop goal_judged <provider/model> <desc> | /loop <N> <task>",
+			"Start a loop. Usage: /loop goal <desc> | /loop <N> <task>",
 		getArgumentCompletions: (prefix: string) => {
 			// Filter by the current argument: once the user types the goal
 			// text, the completion must disappear so accepting it cannot
 			// replace what they typed (AutocompleteItem.value replaces the
 			// whole current argument).
-			// No completions are offered for the judge model slug: accepting an
-			// argument completion replaces the whole argument and does not submit,
-			// which is the /model footgun. Mode keywords only.
 			const items = [
 				{
 					value: "goal ",
 					label: "goal <description>",
 					description: "Loop until goal is met",
-				},
-				{
-					value: "goal_judged ",
-					label: "goal_judged <provider/model> <description>",
-					description: "Loop until an independent judge agrees",
 				},
 			];
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
@@ -162,7 +136,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!args?.trim()) {
 				ctx.ui.notify(
-					"Usage:\n  /loop goal <description>\n  /loop goal_judged <provider/model> <description>\n  /loop <N> <task>",
+					"Usage:\n  /loop goal <description>\n  /loop <N> <task>",
 					"info",
 				);
 				return;
@@ -177,13 +151,11 @@ export default function (pi: ExtensionAPI) {
 
 			if (mode === "goal") {
 				result = parseGoalArgs(parts);
-			} else if (mode === "goal_judged") {
-				result = parseJudgedArgs(parts, ctx.modelRegistry);
 			} else if (/^\d+$/.test(mode)) {
 				result = parsePassesArgs(parts);
 			} else {
 				ctx.ui.notify(
-					`Unknown mode "${mode}". Use: goal, goal_judged, or <N> for an exact-count loop`,
+					`Unknown mode "${mode}". Use: goal, or <N> for an exact-count loop`,
 					"error",
 				);
 				return;

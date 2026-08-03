@@ -115,13 +115,9 @@ describe("/loop completions", () => {
 	it("offers the goal completion only while the prefix matches", () => {
 		const h = createHarness();
 		const completions = loopCmd(h).getArgumentCompletions!;
-		// "goal " and "goal_judged " both start with these prefixes
-		expect(completions("goal")).toHaveLength(2);
-		expect(completions("go")).toHaveLength(2);
-		expect(completions("")).toHaveLength(2);
-		expect(completions("goal_")).toHaveLength(1);
-		const judged = completions("goal_") as { value: string }[];
-		expect(judged[0].value).toBe("goal_judged ");
+		expect(completions("goal")).toHaveLength(1);
+		expect(completions("go")).toHaveLength(1);
+		expect(completions("")).toHaveLength(1);
 	});
 
 	it("never offers the completion while a goal is being typed", () => {
@@ -139,7 +135,7 @@ describe("/loop command", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			"Usage:\n  /loop goal <description>\n  /loop goal_judged <provider/model> <description>\n  /loop <N> <task>",
+			"Usage:\n  /loop goal <description>\n  /loop <N> <task>",
 			"info",
 		);
 		expect(h.sentUserMessages).toHaveLength(0);
@@ -169,7 +165,7 @@ describe("/loop command", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("passes 3 refine", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			'Unknown mode "passes". Use: goal, goal_judged, or <N> for an exact-count loop',
+			'Unknown mode "passes". Use: goal, or <N> for an exact-count loop',
 			"error",
 		);
 		expect(h.sentUserMessages).toHaveLength(0);
@@ -179,7 +175,7 @@ describe("/loop command", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("pipeline a|b do stuff", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			'Unknown mode "pipeline". Use: goal, goal_judged, or <N> for an exact-count loop',
+			'Unknown mode "pipeline". Use: goal, or <N> for an exact-count loop',
 			"error",
 		);
 	});
@@ -292,23 +288,38 @@ describe("stop controls", () => {
 });
 
 describe("reconstruction defaults", () => {
-	it("fills fields missing from pre-upgrade details instead of leaving them undefined", async () => {
+	it("fills fields missing from older details instead of restoring undefined", async () => {
 		const h = createHarness();
-		// details recorded before judgeModel/denials existed
+		// details written before a field existed
 		h.branch.push({
 			type: "message",
 			message: {
 				role: "toolResult",
 				toolName: "loop_control",
-				details: {
-					active: true,
-					mode: "goal",
-					currentStep: 2,
-					maxSteps: null,
-					goal: "legacy",
-					done: false,
-					reasonDone: "",
-				},
+				details: { active: true, mode: "goal", currentStep: 2, goal: "legacy" },
+			},
+		});
+		await h.handlers.get("session_start")!({}, h.ctx);
+		const res = (await h.toolDefs[0].execute(
+			"1",
+			{ status: "next", summary: "s" },
+			undefined,
+			vi.fn(),
+			h.ctx,
+		)) as { details: { maxSteps: number | null; currentStep: number; done: boolean } };
+		expect(res.details.currentStep).toBe(3);
+		expect(res.details.maxSteps).toBe(0);
+		expect(res.details.done).toBe(false);
+	});
+
+	it("still nudges a restored active loop", async () => {
+		const h = createHarness();
+		h.branch.push({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "loop_control",
+				details: { active: true, mode: "goal", currentStep: 2, maxSteps: null, goal: "restored", done: false, reasonDone: "" },
 			},
 		});
 		await h.handlers.get("session_start")!({}, h.ctx);
@@ -316,14 +327,8 @@ describe("reconstruction defaults", () => {
 			{ messages: [{ role: "assistant", stopReason: "stop" }] },
 			h.ctx,
 		);
-		// the restored loop still nudges, proving active survived the merge
 		expect(h.sentMessages).toHaveLength(1);
 		expect(h.sentMessages[0].msg.content).toContain("iteration 3");
-		// and the missing counter defaulted to 0 rather than undefined/NaN
-		const tool = h.toolDefs[0];
-		const res = (await tool.execute("1", { status: "next", summary: "s" }, undefined, vi.fn(), h.ctx)) as { details: { denials: number } };
-		expect(res.details.denials).toBe(0);
-		expect(Number.isNaN(res.details.denials)).toBe(false);
 	});
 });
 
