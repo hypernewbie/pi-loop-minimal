@@ -18,6 +18,11 @@ export interface LoopState {
 	goal: string; // User's description of what we're doing
 	done: boolean; // LLM signaled completion
 	reasonDone: string; // Why the LLM stopped
+	// Endless loop: the model cannot close it. "done" is converted into an
+	// advance, so only /loop-stop or Ctrl+Shift+X ends it. This is a flag on
+	// goal mode rather than a third LoopMode, so every `mode === "passes"`
+	// branch stays untouched.
+	forever: boolean;
 }
 
 export function emptyState(): LoopState {
@@ -29,6 +34,7 @@ export function emptyState(): LoopState {
 		goal: "",
 		done: false,
 		reasonDone: "",
+		forever: false,
 	};
 }
 
@@ -47,6 +53,16 @@ export function buildPrompt(state: LoopState): string {
 					? `This is a refinement pass. Review and improve on the previous pass.`
 					: `This is the **final pass**. Do a final polish, then call loop_control with status "done".`,
 			`\nWhen this pass is complete, call loop_control with status "next" (or "done" on the final pass).`,
+		].join("\n");
+	}
+
+	if (state.forever) {
+		return [
+			`## Loop — Iteration ${step + 1} (forever)`,
+			`Task: ${state.goal}`,
+			`Keep working on the task. This loop does not end on its own.`,
+			`When this iteration is complete, call loop_control with status "next" to continue into the next one.`,
+			`Status "done" is ignored here — only the user can stop this loop.`,
 		].join("\n");
 	}
 
@@ -74,6 +90,25 @@ export function parseGoalArgs(parts: string[]): LoopState | string {
 		goal,
 		done: false,
 		reasonDone: "",
+		forever: false,
+	};
+}
+
+// /loop forever <task> — runs until the user stops it
+export function parseForeverArgs(parts: string[]): LoopState | string {
+	const task = parts.slice(1).join(" ");
+	if (!task) {
+		return "Provide a task description";
+	}
+	return {
+		active: true,
+		mode: "goal",
+		currentStep: 0,
+		maxSteps: null,
+		goal: task,
+		done: false,
+		reasonDone: "",
+		forever: true,
 	};
 }
 
@@ -95,6 +130,7 @@ export function parsePassesArgs(parts: string[]): LoopState | string {
 		goal: task,
 		done: false,
 		reasonDone: "",
+		forever: false,
 	};
 }
 
@@ -111,6 +147,9 @@ export function buildNudgePrompt(state: LoopState): string {
 		`The loop is still active — you ended your turn before finishing ${label}.`,
 		`Continue working on: ${state.goal}`,
 		"Do not end your turn until this iteration is complete.",
+		...(state.forever
+			? ["This loop runs until the user stops it; it has no final iteration."]
+			: []),
 	].join("\n");
 }
 
@@ -128,10 +167,11 @@ export function updateWidget(state: LoopState, ctx: ExtensionContext) {
 		state.mode === "passes"
 			? `pass ${state.currentStep + 1}/${state.maxSteps}`
 			: `iter ${state.currentStep + 1}`;
+	const forever = state.forever ? " · forever" : "";
 
-	ctx.ui.setStatus("loop", `loop · ${label}`);
+	ctx.ui.setStatus("loop", `loop · ${label}${forever}`);
 	ctx.ui.setWidget("loop", [
-		`${label} · ${state.goal}`,
+		`${label}${forever} · ${state.goal}`,
 		"Ctrl+Shift+X to stop",
 	]);
 }
@@ -142,9 +182,11 @@ export function getSystemPromptAddition(state: LoopState): string {
 		"",
 		"",
 		"## Active Loop",
-		`Mode: ${state.mode} | Step: ${state.currentStep + 1}/${state.maxSteps === null ? "∞" : state.maxSteps}`,
+		`Mode: ${state.mode}${state.forever ? " (forever)" : ""} | Step: ${state.currentStep + 1}/${state.maxSteps === null ? "∞" : state.maxSteps}`,
 		`Goal: ${state.goal}`,
 		"You MUST call `loop_control` when you finish your work for this iteration.",
-		'Use status "next" to advance or "done" when the goal is fully met.',
+		state.forever
+			? 'Use status "next" to advance. This loop never ends on its own — "done" is ignored, only the user can stop it.'
+			: 'Use status "next" to advance or "done" when the goal is fully met.',
 	].join("\n");
 }

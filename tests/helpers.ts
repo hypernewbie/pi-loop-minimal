@@ -17,6 +17,7 @@ export function countState(step: number, max: number): LoopState {
 		goal: "task",
 		done: false,
 		reasonDone: "",
+		forever: false,
 	};
 }
 
@@ -29,6 +30,7 @@ export function goalState(step = 0): LoopState {
 		goal: "green tests",
 		done: false,
 		reasonDone: "",
+		forever: false,
 	};
 }
 
@@ -46,3 +48,8 @@ export function captureUi() {
 }
 
 export { vi };
+
+/** Endless loop state. */
+export function foreverState(step = 0): LoopState {
+	return { ...goalState(step), goal: "watch the build", forever: true };
+}

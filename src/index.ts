@@ -23,6 +23,7 @@ import {
 	emptyState,
 	getSystemPromptAddition,
 	type LoopState,
+	parseForeverArgs,
 	parseGoalArgs,
 	parsePassesArgs,
 	updateWidget,
@@ -41,10 +42,36 @@ export default function (pi: ExtensionAPI) {
 	// used by agent_end to detect a turn that ended without closing the loop.
 	let awaitingControl = false;
 
+	// Persisted marker for a user stop. A stopped loop leaves no terminal
+	// loop_control record — a forever loop never writes one at all — so without
+	// this the last result's `active: true` would resurrect the loop on restart.
+	const STOP_ENTRY = "loop-stopped";
+
+	const stopLoop = (reason: string, ctx: ExtensionContext) => {
+		state.active = false;
+		state.done = true;
+		state.reasonDone = reason;
+		awaitingControl = false;
+		pi.appendEntry(STOP_ENTRY, { reason });
+		updateWidget(state, ctx);
+	};
+
 	// ── Reconstruct state from session branch ────────────────────────────
 	const reconstruct = (ctx: ExtensionContext) => {
 		state = emptyState();
 		for (const entry of ctx.sessionManager.getBranch()) {
+			// Entries are replayed in order, so a stop marker after the last
+			// loop_control result wins — and a loop started after a stop wins again.
+			if (entry.type === "custom" && entry.customType === STOP_ENTRY) {
+				const reason = (entry.data as { reason?: string } | undefined)?.reason;
+				state = {
+					...state,
+					active: false,
+					done: true,
+					reasonDone: reason ?? "Stopped by user",
+				};
+				continue;
+			}
 			if (entry.type !== "message") continue;
 			const msg = entry.message;
 			if (msg.role === "toolResult" && msg.toolName === "loop_control") {
@@ -117,7 +144,7 @@ export default function (pi: ExtensionAPI) {
 	// ── /loop command — start a loop ─────────────────────────────────────
 	pi.registerCommand("loop", {
 		description:
-			"Start a loop. Usage: /loop goal <desc> | /loop <N> <task>",
+			"Start a loop. Usage: /loop goal <desc> | /loop forever <task> | /loop <N> <task>",
 		getArgumentCompletions: (prefix: string) => {
 			// Filter by the current argument: once the user types the goal
 			// text, the completion must disappear so accepting it cannot
@@ -129,6 +156,11 @@ export default function (pi: ExtensionAPI) {
 					label: "goal <description>",
 					description: "Loop until goal is met",
 				},
+				{
+					value: "forever ",
+					label: "forever <task>",
+					description: "Loop until you stop it",
+				},
 			];
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
@@ -136,7 +168,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!args?.trim()) {
 				ctx.ui.notify(
-					"Usage:\n  /loop goal <description>\n  /loop <N> <task>",
+					"Usage:\n  /loop goal <description>\n  /loop forever <task>\n  /loop <N> <task>",
 					"info",
 				);
 				return;
@@ -151,11 +183,13 @@ export default function (pi: ExtensionAPI) {
 
 			if (mode === "goal") {
 				result = parseGoalArgs(parts);
+			} else if (mode === "forever") {
+				result = parseForeverArgs(parts);
 			} else if (/^\d+$/.test(mode)) {
 				result = parsePassesArgs(parts);
 			} else {
 				ctx.ui.notify(
-					`Unknown mode "${mode}". Use: goal, or <N> for an exact-count loop`,
+					`Unknown mode "${mode}". Use: goal, forever, or <N> for an exact-count loop`,
 					"error",
 				);
 				return;
@@ -182,11 +216,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("No active loop", "info");
 				return;
 			}
-			state.active = false;
-			state.done = true;
-			state.reasonDone = "Stopped by user";
-			awaitingControl = false;
-			updateWidget(state, ctx);
+			stopLoop("Stopped by user", ctx);
 			ctx.ui.notify(
 				`Loop stopped after ${state.currentStep + 1} iteration(s)`,
 				"warning",
@@ -199,11 +229,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Stop the active loop",
 		handler: async (ctx) => {
 			if (!state.active) return;
-			state.active = false;
-			state.done = true;
-			state.reasonDone = "Stopped by shortcut";
-			awaitingControl = false;
-			updateWidget(state, ctx);
+			stopLoop("Stopped by shortcut", ctx);
 			ctx.abort(); // also abort the current LLM turn
 			ctx.ui.notify("Loop aborted", "warning");
 		},

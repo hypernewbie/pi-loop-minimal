@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	getLoopControlToolDefinition,
@@ -7,7 +7,7 @@ import {
 	renderLoopControlResult,
 } from "../src/tool.ts";
 import type { LoopState } from "../src/state.ts";
-import { countState, goalState } from "./helpers.ts";
+import { countState, foreverState, goalState } from "./helpers.ts";
 
 type ToolParams = { status: "next" | "done"; summary: string; reason?: string };
 
@@ -31,6 +31,7 @@ describe("handleLoopControlTool — no active loop", () => {
 			goal: "",
 			done: false,
 			reasonDone: "",
+			forever: false,
 		};
 		const r = handleLoopControlTool(
 			{ status: "next", summary: "x" },
@@ -277,3 +278,75 @@ describe("renderers", () => {
 });
 
 export type { ToolParams };
+
+describe("forever loops — the model cannot close them", () => {
+	const pi = { sendMessage: vi.fn(), sendUserMessage: vi.fn() } as unknown as ExtensionAPI;
+	const ctx = {} as never;
+
+	it("converts 'done' into an advance and says so", () => {
+		const r = handleLoopControlTool(
+			{ status: "done", summary: "I think we're finished", reason: "goal met" },
+			foreverState(2),
+			pi,
+			ctx,
+		);
+		expect(r.newState.active).toBe(true);
+		expect(r.newState.done).toBe(false);
+		expect(r.newState.reasonDone).toBe("");
+		expect(r.newState.currentStep).toBe(3);
+		expect(r.content[0].text).toContain('This loop runs forever — "done" is ignored');
+		expect(r.content[0].text).toContain("Continuing to iteration 4");
+		expect(r.content[0].text).toContain("I think we're finished");
+	});
+
+	it("steers the next iteration on a refused done", () => {
+		const send = vi.fn();
+		handleLoopControlTool(
+			{ status: "done", summary: "s" },
+			foreverState(0),
+			{ sendMessage: send } as unknown as ExtensionAPI,
+			ctx,
+		);
+		expect(send).toHaveBeenCalledTimes(1);
+		const [msg, opts] = send.mock.calls[0];
+		expect(msg.content).toContain("## Loop — Iteration 2 (forever)");
+		expect(opts).toEqual({ triggerTurn: true, deliverAs: "steer" });
+	});
+
+	it("advances normally on 'next'", () => {
+		const r = handleLoopControlTool(
+			{ status: "next", summary: "did a pass" },
+			foreverState(5),
+			pi,
+			ctx,
+		);
+		expect(r.newState.currentStep).toBe(6);
+		expect(r.content[0].text).toContain("→ Advancing to step 7");
+		expect(r.content[0].text).not.toContain("ignored");
+	});
+
+	it("never completes, however many times done is called", () => {
+		let state = foreverState(0);
+		for (let i = 0; i < 25; i++) {
+			state = handleLoopControlTool({ status: "done", summary: "s" }, state, pi, ctx).newState;
+		}
+		expect(state.active).toBe(true);
+		expect(state.done).toBe(false);
+		expect(state.currentStep).toBe(25);
+	});
+
+	it("keeps the completion path for unflagged goal loops", () => {
+		const r = handleLoopControlTool({ status: "done", summary: "s" }, goalState(0), pi, ctx);
+		expect(r.newState.done).toBe(true);
+		expect(r.newState.active).toBe(false);
+	});
+
+	it("renders the endless marker on the tool result", () => {
+		const out = renderLoopControlResult(
+			{ details: { ...foreverState(3), currentStep: 3 } },
+			{},
+			{ fg: (_c: string, t: string) => t },
+		) as unknown as { text?: string };
+		expect(JSON.stringify(out)).toContain("iter 3 · forever");
+	});
+});

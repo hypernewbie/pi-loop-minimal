@@ -35,7 +35,10 @@ export function handleLoopControlTool(
 		};
 	}
 
-	if (params.status === "done") {
+	// A forever loop cannot be closed by the model: "done" becomes an advance.
+	const refusedDone = params.status === "done" && state.forever;
+
+	if (params.status === "done" && !state.forever) {
 		const newState = {
 			...state,
 			done: true,
@@ -54,11 +57,15 @@ export function handleLoopControlTool(
 		};
 	}
 
-	// status === "next" — advance
+	// status === "next" (or a refused "done") — advance
 	const newState = { ...state, currentStep: state.currentStep + 1 };
 
+	// `!forever` is belt and braces: parseForeverArgs only mints goal mode, so
+	// this can only matter for hand-edited session details.
 	const atEnd =
-		state.mode === "passes" && newState.currentStep >= (state.maxSteps ?? 0);
+		!state.forever &&
+		state.mode === "passes" &&
+		newState.currentStep >= (state.maxSteps ?? 0);
 
 	if (atEnd) {
 		const finalState = {
@@ -92,7 +99,9 @@ export function handleLoopControlTool(
 		content: [
 			{
 				type: "text",
-				text: `→ Advancing to step ${newState.currentStep + 1}. Summary: ${params.summary}`,
+				text: refusedDone
+					? `This loop runs forever — "done" is ignored. → Continuing to iteration ${newState.currentStep + 1}. Summary: ${params.summary}`
+					: `→ Advancing to step ${newState.currentStep + 1}. Summary: ${params.summary}`,
 			},
 		],
 		details: { ...newState } as LoopState,
@@ -153,6 +162,8 @@ export function renderLoopControlResult(
 		? "✓ loop complete"
 		: d.mode === "passes"
 			? `→ pass ${d.currentStep}/${d.maxSteps}`
-			: `→ iter ${d.currentStep}`;
+			: d.forever
+				? `→ iter ${d.currentStep} · forever`
+				: `→ iter ${d.currentStep}`;
 	return new Text(t.fg(d.done ? "success" : "accent", label), 0, 0);
 }

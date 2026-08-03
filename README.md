@@ -11,6 +11,9 @@ matter.
 - **Goal loops** — `/loop goal <description>`: iterate until the model calls
   `loop_control` with `done`. Open-ended: there is no iteration cap, matching
   the original behavior.
+- **Forever loops** — `/loop forever <task>`: never ends on its own. The model
+  cannot close it — `loop_control` with `done` is converted into an advance —
+  so it runs until **you** stop it.
 - **Exact-count loops** — `/loop <N> <task>`: exactly N passes. Advancing past
   the final pass completes the loop; `done` before the final pass also
   completes it.
@@ -43,6 +46,7 @@ pi install git:github.com/hypernewbie/pi-loop-minimal
 | Command | Description |
 |---|---|
 | `/loop goal <description>` | Iterate until the goal is met |
+| `/loop forever <task>` | Iterate until you stop it; the model cannot end it |
 | `/loop <N> <task>` | Run exactly N passes (N >= 1) |
 | `/loop-stop` | Stop the active loop |
 
@@ -61,6 +65,31 @@ pi install git:github.com/hypernewbie/pi-loop-minimal
 Count semantics are strict: `/loop 3 …` runs **exactly** three passes. A
 `done` on pass 2 completes the loop after 2 iterations; `next` on pass 3
 completes it after 3. Goal loops never end on `next`.
+
+## Forever loops
+
+```bash
+/loop forever keep hunting flaky tests
+```
+
+Goal mode minus the model's ability to finish: `loop_control` with `done` is
+refused and turned into an advance (`This loop runs forever — "done" is
+ignored. → Continuing to iteration 4`), the iteration prompt tells the model
+only `next` exists, and the widget/footer carry a `· forever` marker.
+
+Stopping is yours alone:
+
+| Action | Effect on a forever loop |
+|---|---|
+| `/loop-stop` | Ends it |
+| `Ctrl+Shift+X` | Ends it and aborts the in-flight turn |
+| `Esc` | Aborts the current turn only — the loop stays armed and the next turn end resumes it |
+| model calls `done` | Ignored; the loop advances |
+
+Both stop paths write a `loop-stopped` entry via `pi.appendEntry`, so a stopped
+loop stays stopped across a restart. Without it, reconstruction would replay the
+last `loop_control` result — which for a forever loop always says `active` —
+and the force-close nudge would bring the loop back to life on the next turn.
 
 ## Status widget
 
@@ -92,6 +121,8 @@ mode). Tool results render as `→ pass 2/5`, `→ iter 3`, or `✓ loop complet
   `maxSteps: null` and treats `null` as unbounded.
 - **Tighter count parsing**: `/loop 3abc …` is rejected instead of being
   accepted as 3 via `parseInt` slop.
+- **Forever loops**: new `/loop forever <task>` form, and a persisted stop
+  marker so a user stop survives a session restart.
 - **Force-close nudge**: new `agent_end` behavior — a run that ends while
   the loop is still open is steered with a "continue working" message
   (never after abort/error). The original just went silent.
@@ -105,7 +136,7 @@ the tool description with the pipeline removal.
 
 ```bash
 npm install
-npm test          # vitest — 87 tests
+npm test          # vitest — 114 tests
 npm run typecheck # tsc --noEmit (src + tests)
 npm pack --dry-run
 ```

@@ -4,12 +4,19 @@ import {
 	buildPrompt,
 	emptyState,
 	getSystemPromptAddition,
+	parseForeverArgs,
 	parseGoalArgs,
 	parsePassesArgs,
 	updateWidget,
 } from "../src/state.ts";
 import type { LoopState } from "../src/state.ts";
-import { captureUi, countState, goalState, parseOk } from "./helpers.ts";
+import {
+	captureUi,
+	countState,
+	foreverState,
+	goalState,
+	parseOk,
+} from "./helpers.ts";
 
 describe("emptyState", () => {
 	it("is inactive with a zeroed goal-mode shape", () => {
@@ -21,6 +28,7 @@ describe("emptyState", () => {
 			goal: "",
 			done: false,
 			reasonDone: "",
+			forever: false,
 		});
 	});
 });
@@ -198,3 +206,70 @@ describe("updateWidget", () => {
 
 // keep LoopState referenced for type-level completeness of helpers
 export type { LoopState };
+
+describe("forever loops", () => {
+	it("parses /loop forever <task> as an unbounded goal loop with the flag set", () => {
+		const s = parseOk(parseForeverArgs(["forever", "watch", "the", "build"]));
+		expect(s).toMatchObject({
+			active: true,
+			mode: "goal",
+			currentStep: 0,
+			maxSteps: null,
+			goal: "watch the build",
+			done: false,
+			forever: true,
+		});
+	});
+
+	it("requires a task description", () => {
+		expect(parseForeverArgs(["forever"])).toBe("Provide a task description");
+		expect(parseForeverArgs([])).toBe("Provide a task description");
+	});
+
+	it("leaves the other forms unflagged", () => {
+		expect(parseOk(parseGoalArgs(["goal", "x"])).forever).toBe(false);
+		expect(parseOk(parsePassesArgs(["3", "x"])).forever).toBe(false);
+		expect(emptyState().forever).toBe(false);
+	});
+
+	it("prompts for continuation and never for completion", () => {
+		const p = buildPrompt(foreverState(2));
+		expect(p).toContain("## Loop — Iteration 3 (forever)");
+		expect(p).toContain("Task: watch the build");
+		expect(p).toContain("This loop does not end on its own");
+		expect(p).toContain('status "next"');
+		expect(p).toContain('Status "done" is ignored');
+		expect(p).not.toContain("When the goal is fully met");
+	});
+
+	it("keeps the ordinary goal prompt for unflagged goal loops", () => {
+		expect(buildPrompt(goalState())).not.toContain("forever");
+	});
+
+	it("marks the loop endless in the widget and footer", () => {
+		const u = captureUi();
+		updateWidget(foreverState(4), u.ctx);
+		expect(u.status).toBe("loop · iter 5 · forever");
+		expect(u.widget).toEqual([
+			"iter 5 · forever · watch the build",
+			"Ctrl+Shift+X to stop",
+		]);
+	});
+
+	it("tells a bug-ended turn there is no final iteration", () => {
+		const n = buildNudgePrompt(foreverState(1));
+		expect(n).toContain("Continue working on: watch the build");
+		expect(n).toContain("runs until the user stops it");
+	});
+
+	it("does not add that line for ordinary loops", () => {
+		expect(buildNudgePrompt(goalState())).not.toContain("until the user stops it");
+	});
+
+	it("says 'done' is ignored in the system prompt", () => {
+		const p = getSystemPromptAddition(foreverState());
+		expect(p).toContain("never ends on its own");
+		expect(p).toContain('"done" is ignored');
+		expect(getSystemPromptAddition(goalState())).toContain("when the goal is fully met");
+	});
+});

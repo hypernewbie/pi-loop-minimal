@@ -53,6 +53,8 @@ function createHarness() {
 		sendMessage: (msg: unknown, opts: unknown) =>
 			sentMessages.push({ msg: msg as never, opts }),
 		sendUserMessage: (content: string) => sentUserMessages.push(content),
+		appendEntry: (customType: string, data?: unknown) =>
+			branch.push({ type: "custom", customType, data } as never),
 	} as unknown as ExtensionAPI;
 
 	const ctx = {
@@ -117,7 +119,9 @@ describe("/loop completions", () => {
 		const completions = loopCmd(h).getArgumentCompletions!;
 		expect(completions("goal")).toHaveLength(1);
 		expect(completions("go")).toHaveLength(1);
-		expect(completions("")).toHaveLength(1);
+		expect(completions("")).toHaveLength(2);
+		expect(completions("for")).toHaveLength(1);
+		expect((completions("for") as { value: string }[])[0].value).toBe("forever ");
 	});
 
 	it("never offers the completion while a goal is being typed", () => {
@@ -135,7 +139,7 @@ describe("/loop command", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			"Usage:\n  /loop goal <description>\n  /loop <N> <task>",
+			"Usage:\n  /loop goal <description>\n  /loop forever <task>\n  /loop <N> <task>",
 			"info",
 		);
 		expect(h.sentUserMessages).toHaveLength(0);
@@ -165,7 +169,7 @@ describe("/loop command", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("passes 3 refine", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			'Unknown mode "passes". Use: goal, or <N> for an exact-count loop',
+			'Unknown mode "passes". Use: goal, forever, or <N> for an exact-count loop',
 			"error",
 		);
 		expect(h.sentUserMessages).toHaveLength(0);
@@ -175,7 +179,7 @@ describe("/loop command", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("pipeline a|b do stuff", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			'Unknown mode "pipeline". Use: goal, or <N> for an exact-count loop',
+			'Unknown mode "pipeline". Use: goal, forever, or <N> for an exact-count loop',
 			"error",
 		);
 	});
@@ -329,6 +333,183 @@ describe("reconstruction defaults", () => {
 		);
 		expect(h.sentMessages).toHaveLength(1);
 		expect(h.sentMessages[0].msg.content).toContain("iteration 3");
+	});
+});
+
+describe("/loop forever", () => {
+	it("starts an endless loop and kicks off iteration 1", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever keep polishing the docs", h.ctx);
+		expect(h.ui.notify).not.toHaveBeenCalled();
+		expect(h.sentUserMessages[0]).toContain("## Loop — Iteration 1 (forever)");
+		expect(h.sentUserMessages[0]).toContain("keep polishing the docs");
+	});
+
+	it("rejects a missing task", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever", h.ctx);
+		expect(h.ui.notify).toHaveBeenCalledWith("Provide a task description", "error");
+		expect(h.sentUserMessages).toHaveLength(0);
+	});
+
+	it("ignores the model's done and keeps going", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever tidy up", h.ctx);
+		const r = (await h.toolDefs[0].execute(
+			"1",
+			{ status: "done", summary: "finished" },
+			undefined,
+			vi.fn(),
+			h.ctx,
+		)) as { content: { text: string }[]; details: { active: boolean; done: boolean } };
+		expect(r.details).toMatchObject({ active: true, done: false });
+		expect(r.content[0].text).toContain('"done" is ignored');
+		expect(h.sentMessages.at(-1)!.msg.content).toContain("Iteration 2 (forever)");
+	});
+
+	it("/loop-stop still ends it", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever tidy up", h.ctx);
+		await stopCmd(h).handler("", h.ctx);
+		expect(h.ui.notify).toHaveBeenCalledWith(
+			"Loop stopped after 1 iteration(s)",
+			"warning",
+		);
+		// and a later bug-end is not nudged
+		await h.handlers.get("agent_end")!(
+			{ messages: [{ role: "assistant", stopReason: "stop" }] },
+			h.ctx,
+		);
+		expect(h.sentMessages.filter((m) => m.msg.customType === "loop-nudge")).toHaveLength(0);
+	});
+
+	it("Ctrl+Shift+X still ends it and aborts the turn", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever tidy up", h.ctx);
+		const shortcut = [...h.shortcuts.values()][0];
+		await shortcut.handler(h.ctx);
+		expect(h.ctx.abort).toHaveBeenCalled();
+		expect(h.ui.notify).toHaveBeenCalledWith("Loop aborted", "warning");
+	});
+
+	it("nudges a bug-ended turn while it is running", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever tidy up", h.ctx);
+		await h.handlers.get("agent_end")!(
+			{ messages: [{ role: "assistant", stopReason: "stop" }] },
+			h.ctx,
+		);
+		const nudges = h.sentMessages.filter((m) => m.msg.customType === "loop-nudge");
+		expect(nudges).toHaveLength(1);
+		expect(nudges[0].msg.content).toContain("runs until the user stops it");
+	});
+
+	it("survives reconstruction as an endless loop", async () => {
+		const h = createHarness();
+		h.branch.push({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "loop_control",
+				details: {
+					active: true, mode: "goal", currentStep: 7, maxSteps: null,
+					goal: "restored forever", done: false, reasonDone: "", forever: true,
+				},
+			},
+		});
+		await h.handlers.get("session_start")!({}, h.ctx);
+		const r = (await h.toolDefs[0].execute(
+			"1",
+			{ status: "done", summary: "s" },
+			undefined,
+			vi.fn(),
+			h.ctx,
+		)) as { details: { active: boolean; forever: boolean; currentStep: number } };
+		expect(r.details).toMatchObject({ active: true, forever: true, currentStep: 8 });
+	});
+});
+
+describe("a stopped loop stays stopped across restarts", () => {
+	const restart = async (h: ReturnType<typeof createHarness>) =>
+		h.handlers.get("session_start")!({}, h.ctx);
+	const nudge = async (h: ReturnType<typeof createHarness>) =>
+		h.handlers.get("agent_end")!(
+			{ messages: [{ role: "assistant", stopReason: "stop" }] },
+			h.ctx,
+		);
+
+	it("persists a stop marker so a forever loop cannot resurrect", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever tidy up", h.ctx);
+		await h.toolDefs[0].execute("1", { status: "next", summary: "s" }, undefined, vi.fn(), h.ctx);
+		await stopCmd(h).handler("", h.ctx);
+		expect(h.branch.some((e) => (e as { customType?: string }).customType === "loop-stopped")).toBe(true);
+
+		// fresh extension instance replaying the same branch
+		const h2 = createHarness();
+		h2.branch.push(...h.branch);
+		await restart(h2);
+		await nudge(h2);
+		expect(h2.sentMessages.filter((m) => m.msg.customType === "loop-nudge")).toHaveLength(0);
+	});
+
+	it("keeps the shortcut stop across a restart too", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever tidy up", h.ctx);
+		await [...h.shortcuts.values()][0].handler(h.ctx);
+		const h2 = createHarness();
+		h2.branch.push(...h.branch);
+		await restart(h2);
+		await nudge(h2);
+		expect(h2.sentMessages).toHaveLength(0);
+	});
+
+	it("records the stop reason", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal x", h.ctx);
+		await stopCmd(h).handler("", h.ctx);
+		const marker = h.branch.find(
+			(e) => (e as { customType?: string }).customType === "loop-stopped",
+		) as { data?: { reason?: string } };
+		expect(marker.data?.reason).toBe("Stopped by user");
+	});
+
+	it("lets a loop started after a stop win", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever first", h.ctx);
+		await stopCmd(h).handler("", h.ctx);
+		// a later loop_control result (newer than the marker) restores an active loop
+		h.branch.push({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "loop_control",
+				details: {
+					active: true, mode: "goal", currentStep: 1, maxSteps: null,
+					goal: "second", done: false, reasonDone: "", forever: true,
+				},
+			},
+		});
+		const h2 = createHarness();
+		h2.branch.push(...h.branch);
+		await restart(h2);
+		await nudge(h2);
+		expect(h2.sentMessages.filter((m) => m.msg.customType === "loop-nudge")).toHaveLength(1);
+		expect(h2.sentMessages[0].msg.content).toContain("second");
+	});
+
+	it("documents that Esc alone does not exit a forever loop", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("forever tidy up", h.ctx);
+		// aborted run: no nudge for that turn …
+		await h.handlers.get("agent_end")!(
+			{ messages: [{ role: "assistant", stopReason: "aborted" }] },
+			h.ctx,
+		);
+		expect(h.sentMessages).toHaveLength(0);
+		// … but the loop is still armed, so the next ordinary turn end resumes it
+		await nudge(h);
+		expect(h.sentMessages.filter((m) => m.msg.customType === "loop-nudge")).toHaveLength(1);
 	});
 });
 
