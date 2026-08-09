@@ -232,44 +232,42 @@ describe("forever loops", () => {
 		expect(emptyState().forever).toBe(false);
 	});
 
-	it("prompts for continuation and never for completion", () => {
+	it("uses a tool-free continuation prompt", () => {
 		const p = buildPrompt(foreverState(2));
-		expect(p).toContain("## Loop — Iteration 3 (forever)");
+		expect(p).toContain("## Forever Loop");
 		expect(p).toContain("Task: watch the build");
-		expect(p).toContain("This loop does not end on its own");
-		expect(p).toContain('status "next"');
-		expect(p).toContain('Status "done" is ignored');
-		expect(p).not.toContain("When the goal is fully met");
+		expect(p).toContain("remains active until the user stops it");
+		expect(p).toContain("Use the available tools");
+		expect(p).not.toMatch(/loop_control|next|done|Iteration/i);
 	});
 
 	it("keeps the ordinary goal prompt for unflagged goal loops", () => {
 		expect(buildPrompt(goalState())).not.toContain("forever");
 	});
 
-	it("marks the loop endless in the widget and footer", () => {
+	it("marks the loop endless without manufacturing an iteration count", () => {
 		const u = captureUi();
 		updateWidget(foreverState(4), u.ctx);
-		expect(u.status).toBe("loop · iter 5 · forever");
+		expect(u.status).toBe("loop · forever");
 		expect(u.widget).toEqual([
-			"iter 5 · forever · watch the build",
+			"forever · watch the build",
 			"Ctrl+Shift+X to stop",
 		]);
 	});
 
-	it("tells a bug-ended turn there is no final iteration", () => {
+	it("continues a bug-ended turn without control vocabulary", () => {
 		const n = buildNudgePrompt(foreverState(1));
+		expect(n).toContain("The forever loop remains active");
 		expect(n).toContain("Continue working on: watch the build");
-		expect(n).toContain("runs until the user stops it");
+		expect(n).toContain("Only the user can stop");
+		expect(n).not.toMatch(/loop_control|next|done|iteration/i);
 	});
 
-	it("does not add that line for ordinary loops", () => {
-		expect(buildNudgePrompt(goalState())).not.toContain("until the user stops it");
-	});
-
-	it("says 'done' is ignored in the system prompt", () => {
+	it("keeps control vocabulary out of its system addition", () => {
 		const p = getSystemPromptAddition(foreverState());
-		expect(p).toContain("never ends on its own");
-		expect(p).toContain('"done" is ignored');
+		expect(p).toContain("## Active Forever Loop");
+		expect(p).toContain("Continue working until the user stops");
+		expect(p).not.toMatch(/loop_control|next|done|step|iteration/i);
 		expect(getSystemPromptAddition(goalState())).toContain("when the goal is fully met");
 	});
 });

@@ -1,9 +1,10 @@
 // index.ts — Minimal agent loop extension
-// Two loop forms:
+// Loop forms:
 //   /loop goal <description>  — repeat until the LLM declares the goal met
 //   /loop <N> <task>          — repeat exactly N times
+//   /loop forever <task>      — continue until the user stops it
 //
-// The LLM gets a `loop_control` tool to signal progress/completion.
+// Goal/count loops give the LLM `loop_control`; forever intentionally does not.
 // Ctrl+Shift+X to abort at any time.
 //
 // Ported from pi-agent-loop@0.1.1 (MIT). Changes from the original:
@@ -37,21 +38,33 @@ import {
 
 export default function (pi: ExtensionAPI) {
 	let state = emptyState();
-	// Runtime-only: true while the current iteration expects loop_control.
-	// Set when an iteration is dispatched, cleared when loop_control runs;
-	// used by agent_end to detect a turn that ended without closing the loop.
-	let awaitingControl = false;
+	// Runtime-only: true while a live loop expects the next agent-end check.
+	// Goal/count loops clear it when loop_control runs, while tool-free forever
+	// loops keep it armed for every ordinary agent_end continuation.
+	let awaitingContinuation = false;
 
-	// Persisted marker for a user stop. A stopped loop leaves no terminal
-	// loop_control record — a forever loop never writes one at all — so without
-	// this the last result's `active: true` would resurrect the loop on restart.
+	const LOOP_CONTROL_TOOL = "loop_control";
+	const START_ENTRY = "loop-started";
 	const STOP_ENTRY = "loop-stopped";
+
+	// Derive each change from Pi's current list: never restore a stale snapshot
+	// and accidentally overwrite tool choices made by the user or extensions.
+	const setLoopControlActive = (active: boolean) => {
+		const tools = pi.getActiveTools();
+		const hasControl = tools.includes(LOOP_CONTROL_TOOL);
+		if (active === hasControl) return;
+		pi.setActiveTools(
+			active
+				? [...new Set([...tools, LOOP_CONTROL_TOOL])]
+				: tools.filter((name) => name !== LOOP_CONTROL_TOOL),
+		);
+	};
 
 	const stopLoop = (reason: string, ctx: ExtensionContext) => {
 		state.active = false;
 		state.done = true;
 		state.reasonDone = reason;
-		awaitingControl = false;
+		awaitingContinuation = false;
 		pi.appendEntry(STOP_ENTRY, { reason });
 		updateWidget(state, ctx);
 	};
@@ -60,8 +73,13 @@ export default function (pi: ExtensionAPI) {
 	const reconstruct = (ctx: ExtensionContext) => {
 		state = emptyState();
 		for (const entry of ctx.sessionManager.getBranch()) {
-			// Entries are replayed in order, so a stop marker after the last
-			// loop_control result wins — and a loop started after a stop wins again.
+			// Entries are replayed in order: a later start wins over a stop, and a
+			// later stop wins over the start/tool result that preceded it.
+			if (entry.type === "custom" && entry.customType === START_ENTRY) {
+				const d = entry.data as Partial<LoopState> | undefined;
+				if (d) state = { ...emptyState(), ...d };
+				continue;
+			}
 			if (entry.type === "custom" && entry.customType === STOP_ENTRY) {
 				const reason = (entry.data as { reason?: string } | undefined)?.reason;
 				state = {
@@ -82,17 +100,32 @@ export default function (pi: ExtensionAPI) {
 				if (d) state = { ...emptyState(), ...d };
 			}
 		}
-		// A restored active loop was mid-iteration when the session ended:
-		// its iteration still expects loop_control.
-		awaitingControl = state.active;
+		awaitingContinuation = state.active;
+		if (state.active && state.forever) setLoopControlActive(false);
+		updateWidget(state, ctx);
 	};
 
 	pi.on("session_start", async (_e, ctx) => reconstruct(ctx));
 	pi.on("session_tree", async (_e, ctx) => reconstruct(ctx));
 
+	// Tool removal applies to future model requests. Block a call that was
+	// already issued by a stale/queued request before the removal took effect.
+	pi.on("tool_call", (event) => {
+		if (
+			state.active &&
+			state.forever &&
+			event.toolName === LOOP_CONTROL_TOOL
+		) {
+			return {
+				block: true,
+				reason: "loop_control is unavailable during a forever loop.",
+			};
+		}
+	});
+
 	// ── Force-close: nudge a run that ended with the loop still open ────
 	pi.on("agent_end", async (event, _ctx) => {
-		if (!state.active || !awaitingControl) return;
+		if (!state.active || !awaitingContinuation) return;
 		// Never restart a run the user aborted or one that errored: Pi ends
 		// those with a final message carrying stopReason "aborted"/"error".
 		const last = event.messages.at(-1);
@@ -104,6 +137,7 @@ export default function (pi: ExtensionAPI) {
 				? (last as { stopReason?: string }).stopReason
 				: undefined;
 		if (stopReason === "aborted" || stopReason === "error") return;
+		if (state.forever) setLoopControlActive(false);
 		pi.sendMessage(
 			{
 				customType: "loop-nudge",
@@ -122,7 +156,7 @@ export default function (pi: ExtensionAPI) {
 			state = result.newState;
 			// Re-arm for the next iteration; an inactive loop has nothing to
 			// await, so a later agent_end stays silent.
-			awaitingControl = result.newState.active;
+			awaitingContinuation = result.newState.active;
 			updateWidget(state, ctx);
 			return {
 				content: result.content,
@@ -201,9 +235,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			state = result;
-			awaitingControl = true;
+			awaitingContinuation = true;
+			// Forever loops are driven solely by agent_end, so their model request
+			// must not receive loop_control. Normal loop forms opt it back in.
+			setLoopControlActive(!state.forever);
+			pi.appendEntry(START_ENTRY, { ...state });
 			updateWidget(state, ctx);
-			// Kick off the first iteration
+			// Kick off the first work session/iteration.
 			pi.sendUserMessage(buildPrompt(state));
 		},
 	});
@@ -216,9 +254,12 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("No active loop", "info");
 				return;
 			}
+			const wasForever = state.forever;
 			stopLoop("Stopped by user", ctx);
 			ctx.ui.notify(
-				`Loop stopped after ${state.currentStep + 1} iteration(s)`,
+				wasForever
+					? "Forever loop stopped"
+					: `Loop stopped after ${state.currentStep + 1} iteration(s)`,
 				"warning",
 			);
 		},

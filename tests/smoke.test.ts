@@ -24,6 +24,7 @@ function harness() {
 	}[] = [];
 	const sentUser: string[] = [];
 	const sent: { msg: { content?: string }; opts: unknown }[] = [];
+	const activeTools = ["read", "bash", "loop_control"];
 	const ui = { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() };
 	const ctx = {
 		ui,
@@ -39,6 +40,11 @@ function harness() {
 		registerShortcut: () => {},
 		sendMessage: (msg: unknown, opts: unknown) => sent.push({ msg: msg as never, opts }),
 		sendUserMessage: (c: string) => sentUser.push(c),
+		appendEntry: () => {},
+		getActiveTools: () => [...activeTools],
+		setActiveTools: (names: string[]) => {
+			activeTools.splice(0, activeTools.length, ...names);
+		},
 	} as unknown as ExtensionAPI);
 
 	const tool = (p: ToolParams) =>

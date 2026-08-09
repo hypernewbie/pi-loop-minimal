@@ -1,31 +1,28 @@
 # pi-loop-minimal
 
-Pi extension for agent loops: run the model in repeats until a goal is met, or
-exactly N times. A trimmed, modernized port of
+Pi extension for agent loops: run until a goal is met, exactly N times, or
+continuously until you stop it. A trimmed, modernized port of
 [`pi-agent-loop`](https://www.npmjs.com/package/pi-agent-loop) (see
-[Provenance](#provenance-and-license)) that keeps only the two loop modes that
-matter.
+[Provenance](#provenance-and-license)).
 
 ## What it does
 
 - **Goal loops** — `/loop goal <description>`: iterate until the model calls
   `loop_control` with `done`. Open-ended: there is no iteration cap, matching
   the original behavior.
-- **Forever loops** — `/loop forever <task>`: never ends on its own. The model
-  cannot close it — `loop_control` with `done` is converted into an advance —
-  so it runs until **you** stop it.
+- **Forever loops** — `/loop forever <task>`: the model does not receive
+  `loop_control`; ending a turn starts another work turn until **you** stop it.
 - **Exact-count loops** — `/loop <N> <task>`: exactly N passes. Advancing past
   the final pass completes the loop; `done` before the final pass also
   completes it.
-- **Same signal contract**: the model steers each iteration by calling the
-  `loop_control` tool with `status: "next"` or `status: "done"`; the next
-  iteration is steered with the same iteration prompt shape as the original.
+- **Tool-controlled normal loops**: goal and exact-count loops use
+  `loop_control` to advance or finish. Forever loops intentionally do not.
 - **Forced closure**: if the model ends its turn with the loop still open,
   the loop immediately steers it to continue working (`triggerTurn`), so a
   bug-ended turn cannot silently stall the loop. Runs the user aborted
   (`Esc`) or that errored are never restarted.
-- **Session continuity**: state is reconstructed from the last `loop_control`
-  result on session start and on `/tree` navigation, like the original.
+- **Session continuity**: starts, control results, and user stops are replayed
+  on session start and `/tree` navigation.
 
 ## Install
 
@@ -54,13 +51,13 @@ pi install git:github.com/hypernewbie/pi-loop-minimal
 
 ### How a loop runs
 
-1. `/loop …` waits for idle, then kicks off the first iteration as a user
-   message built from the iteration prompt.
-2. The model works on the iteration, then calls `loop_control`:
+1. `/loop …` waits for idle, then kicks off the first work turn as a user
+   message built from the loop prompt.
+2. In goal and exact-count loops, the model calls `loop_control`:
    - `status: "next"` — advance to the next pass / iteration,
    - `status: "done"` — the goal is met (or the loop ends).
-3. The transition is applied, the widget updates, and the next iteration is
-   dispatched as a hidden steer message — or a completion result is returned.
+3. In forever loops, `loop_control` is absent. When the model ends a normal
+   turn, `agent_end` injects a hidden continuation message instead.
 
 Count semantics are strict: `/loop 3 …` runs **exactly** three passes. A
 `done` on pass 2 completes the loop after 2 iterations; `next` on pass 3
@@ -72,10 +69,11 @@ completes it after 3. Goal loops never end on `next`.
 /loop forever keep hunting flaky tests
 ```
 
-Goal mode minus the model's ability to finish: `loop_control` with `done` is
-refused and turned into an advance (`This loop runs forever — "done" is
-ignored. → Continuing to iteration 4`), the iteration prompt tells the model
-only `next` exists, and the widget/footer carry a `· forever` marker.
+Forever mode removes `loop_control` from Pi's active tool list before the
+first model request, so there is no `next`/`done` control for the model to
+spam. When it ends a normal turn, the extension injects a hidden “continue
+working” message. The widget/footer carry a `· forever` marker, not a made-up
+iteration count.
 
 Stopping is yours alone:
 
@@ -84,12 +82,12 @@ Stopping is yours alone:
 | `/loop-stop` | Ends it |
 | `Ctrl+Shift+X` | Ends it and aborts the in-flight turn |
 | `Esc` | Aborts the current turn only — the loop stays armed and the next turn end resumes it |
-| model calls `done` | Ignored; the loop advances |
+| model tries `loop_control` | Blocked as a stale call; no state changes |
 
-Both stop paths write a `loop-stopped` entry via `pi.appendEntry`, so a stopped
-loop stays stopped across a restart. Without it, reconstruction would replay the
-last `loop_control` result — which for a forever loop always says `active` —
-and the force-close nudge would bring the loop back to life on the next turn.
+Starting a loop writes a durable `loop-started` entry and both stop paths
+write `loop-stopped` via `pi.appendEntry`. Thus a tool-free forever loop can
+resume after a restart, while a stopped loop stays stopped. On reconstruction,
+an active forever loop removes `loop_control` again.
 
 ## Status widget
 
@@ -98,15 +96,17 @@ pass 3/5 · refine the renderer
 Ctrl+Shift+X to stop
 ```
 
-Footer status is `loop · pass 3/5` (count mode) or `loop · iter 3` (goal
-mode). Tool results render as `→ pass 2/5`, `→ iter 3`, or `✓ loop complete`.
+Footer status is `loop · pass 3/5` (count mode), `loop · iter 3` (goal mode),
+or `loop · forever`. Tool results render as `→ pass 2/5`, `→ iter 3`, or
+`✓ loop complete`; forever loops produce no control result.
 
 ## What changed from pi-agent-loop
 
-- **Only two forms**: `/loop goal` and `/loop <N> <task>`. The original's
-  `passes <N>` and `pipeline <s1|s2|s3>` grammar forms are gone (the count
-  form survives, respelled; the pipeline mode, `stages` field, and pipeline
-  branches are deleted).
+- **Minimal grammar**: `/loop goal`, `/loop <N> <task>`, and the later
+  `/loop forever <task>`. The original's `passes <N>` and
+  `pipeline <s1|s2|s3>` grammar forms are gone (the count form survives,
+  respelled; the pipeline mode, `stages` field, and pipeline branches are
+  deleted).
 - **Current Pi API**: `@mariozechner/*` and `@sinclair/typebox` replaced with
   the `@earendil-works/*` packages and `typebox`; the dead
   `session_switch`/`session_fork` events and the no-op `agent_end` handler
@@ -121,22 +121,24 @@ mode). Tool results render as `→ pass 2/5`, `→ iter 3`, or `✓ loop complet
   `maxSteps: null` and treats `null` as unbounded.
 - **Tighter count parsing**: `/loop 3abc …` is rejected instead of being
   accepted as 3 via `parseInt` slop.
-- **Forever loops**: new `/loop forever <task>` form, and a persisted stop
-  marker so a user stop survives a session restart.
+- **Tool-free forever loops**: `/loop forever <task>` removes
+  `loop_control` while active and continues only from `agent_end`, so a badly
+  behaving model cannot manufacture progress with repeated `next` calls.
+  Persisted start/stop markers make its state survive restarts.
 - **Force-close nudge**: new `agent_end` behavior — a run that ends while
   the loop is still open is steered with a "continue working" message
   (never after abort/error). The original just went silent.
 
-Everything model-facing — iteration prompts, the `loop_control` schema and
-its descriptions, the system-prompt addition, the completion texts — is
-unchanged from the original except that stage references were dropped from
-the tool description with the pipeline removal.
+For goal and exact-count loops, the model-facing iteration prompts,
+`loop_control` schema, system-prompt addition, and completion texts retain the
+original shape except for removed pipeline-stage references. Forever mode is
+the intentional exception: it has its own tool-free prompt and continuation.
 
 ## Development
 
 ```bash
 npm install
-npm test          # vitest — 114 tests
+npm test          # vitest — 116 tests
 npm run typecheck # tsc --noEmit (src + tests)
 npm pack --dry-run
 ```

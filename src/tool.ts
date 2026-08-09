@@ -35,10 +35,22 @@ export function handleLoopControlTool(
 		};
 	}
 
-	// A forever loop cannot be closed by the model: "done" becomes an advance.
-	const refusedDone = params.status === "done" && state.forever;
+	// A forever loop never exposes this tool. This guard is defense in depth
+	// for stale/direct calls: it must not advance, end, or persist loop state.
+	if (state.forever) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: "loop_control is unavailable during a forever loop.",
+				},
+			],
+			details: undefined,
+			newState: state,
+		};
+	}
 
-	if (params.status === "done" && !state.forever) {
+	if (params.status === "done") {
 		const newState = {
 			...state,
 			done: true,
@@ -57,7 +69,7 @@ export function handleLoopControlTool(
 		};
 	}
 
-	// status === "next" (or a refused "done") — advance
+	// status === "next" — advance
 	const newState = { ...state, currentStep: state.currentStep + 1 };
 
 	// `!forever` is belt and braces: parseForeverArgs only mints goal mode, so
@@ -99,9 +111,7 @@ export function handleLoopControlTool(
 		content: [
 			{
 				type: "text",
-				text: refusedDone
-					? `This loop runs forever — "done" is ignored. → Continuing to iteration ${newState.currentStep + 1}. Summary: ${params.summary}`
-					: `→ Advancing to step ${newState.currentStep + 1}. Summary: ${params.summary}`,
+				text: `→ Advancing to step ${newState.currentStep + 1}. Summary: ${params.summary}`,
 			},
 		],
 		details: { ...newState } as LoopState,

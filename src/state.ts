@@ -18,10 +18,10 @@ export interface LoopState {
 	goal: string; // User's description of what we're doing
 	done: boolean; // LLM signaled completion
 	reasonDone: string; // Why the LLM stopped
-	// Endless loop: the model cannot close it. "done" is converted into an
-	// advance, so only /loop-stop or Ctrl+Shift+X ends it. This is a flag on
-	// goal mode rather than a third LoopMode, so every `mode === "passes"`
-	// branch stays untouched.
+	// Endless loop: continuation happens at agent_end, without exposing
+	// loop_control to the model. Only /loop-stop or Ctrl+Shift+X ends it.
+	// This is a flag on goal mode rather than a third LoopMode, so every
+	// `mode === "passes"` branch stays untouched.
 	forever: boolean;
 }
 
@@ -58,11 +58,10 @@ export function buildPrompt(state: LoopState): string {
 
 	if (state.forever) {
 		return [
-			`## Loop — Iteration ${step + 1} (forever)`,
+			"## Forever Loop",
 			`Task: ${state.goal}`,
-			`Keep working on the task. This loop does not end on its own.`,
-			`When this iteration is complete, call loop_control with status "next" to continue into the next one.`,
-			`Status "done" is ignored here — only the user can stop this loop.`,
+			"This work session remains active until the user stops it.",
+			"Continue working on the task. Use the available tools when they help.",
 		].join("\n");
 	}
 
@@ -139,6 +138,14 @@ export function parsePassesArgs(parts: string[]): LoopState | string {
 // because a turn that ends without closing the loop is usually a bug-end,
 // not a deliberate completion.
 export function buildNudgePrompt(state: LoopState): string {
+	if (state.forever) {
+		return [
+			"The forever loop remains active.",
+			`Continue working on: ${state.goal}`,
+			"Only the user can stop this work session.",
+		].join("\n");
+	}
+
 	const label =
 		state.mode === "passes"
 			? `pass ${state.currentStep + 1}/${state.maxSteps}`
@@ -147,9 +154,6 @@ export function buildNudgePrompt(state: LoopState): string {
 		`The loop is still active — you ended your turn before finishing ${label}.`,
 		`Continue working on: ${state.goal}`,
 		"Do not end your turn until this iteration is complete.",
-		...(state.forever
-			? ["This loop runs until the user stops it; it has no final iteration."]
-			: []),
 	].join("\n");
 }
 
@@ -163,30 +167,46 @@ export function updateWidget(state: LoopState, ctx: ExtensionContext) {
 		return;
 	}
 
+	if (state.forever) {
+		ctx.ui.setStatus("loop", "loop · forever");
+		ctx.ui.setWidget("loop", [
+			`forever · ${state.goal}`,
+			"Ctrl+Shift+X to stop",
+		]);
+		return;
+	}
+
 	const label =
 		state.mode === "passes"
 			? `pass ${state.currentStep + 1}/${state.maxSteps}`
 			: `iter ${state.currentStep + 1}`;
-	const forever = state.forever ? " · forever" : "";
 
-	ctx.ui.setStatus("loop", `loop · ${label}${forever}`);
+	ctx.ui.setStatus("loop", `loop · ${label}`);
 	ctx.ui.setWidget("loop", [
-		`${label}${forever} · ${state.goal}`,
+		`${label} · ${state.goal}`,
 		"Ctrl+Shift+X to stop",
 	]);
 }
 
 // System prompt injection logic
 export function getSystemPromptAddition(state: LoopState): string {
+	if (state.forever) {
+		return [
+			"",
+			"",
+			"## Active Forever Loop",
+			`Task: ${state.goal}`,
+			"Continue working until the user stops this work session.",
+		].join("\n");
+	}
+
 	return [
 		"",
 		"",
 		"## Active Loop",
-		`Mode: ${state.mode}${state.forever ? " (forever)" : ""} | Step: ${state.currentStep + 1}/${state.maxSteps === null ? "∞" : state.maxSteps}`,
+		`Mode: ${state.mode} | Step: ${state.currentStep + 1}/${state.maxSteps === null ? "∞" : state.maxSteps}`,
 		`Goal: ${state.goal}`,
 		"You MUST call `loop_control` when you finish your work for this iteration.",
-		state.forever
-			? 'Use status "next" to advance. This loop never ends on its own — "done" is ignored, only the user can stop it.'
-			: 'Use status "next" to advance or "done" when the goal is fully met.',
+		'Use status "next" to advance or "done" when the goal is fully met.',
 	].join("\n");
 }
