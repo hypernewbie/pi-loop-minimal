@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+	buildEvaluationPrompt,
 	buildNudgePrompt,
 	buildPrompt,
+	buildResumePrompt,
 	emptyState,
 	getSystemPromptAddition,
 	parseForeverArgs,
@@ -11,6 +13,7 @@ import {
 import type { LoopState } from "../src/state.ts";
 import {
 	captureUi,
+	claimingState,
 	foreverState,
 	goalState,
 	parseOk,
@@ -25,6 +28,8 @@ describe("emptyState", () => {
 			done: false,
 			reasonDone: "",
 			forever: false,
+			evaluating: false,
+			claimReason: "",
 		});
 	});
 });
@@ -57,6 +62,7 @@ describe("parseForeverArgs", () => {
 			goal: "watch the build",
 			done: false,
 			forever: true,
+			evaluating: false,
 		});
 	});
 
@@ -68,6 +74,7 @@ describe("parseForeverArgs", () => {
 	it("leaves the goal form unflagged", () => {
 		expect(parseOk(parseGoalArgs(["goal", "x"])).forever).toBe(false);
 		expect(emptyState().forever).toBe(false);
+		expect(parseOk(parseGoalArgs(["goal", "x"])).evaluating).toBe(false);
 	});
 });
 
@@ -104,6 +111,41 @@ describe("buildNudgePrompt", () => {
 	});
 });
 
+describe("buildEvaluationPrompt", () => {
+	it("asks whether the goal has actually been reached", () => {
+		const p = buildEvaluationPrompt(claimingState(2));
+		expect(p).toContain("## Loop — Confirmation check");
+		expect(p).toContain("Goal: green tests");
+		expect(p).toContain("A claim was made that the goal is met: all tests are green");
+		expect(p).toContain("Has the goal actually been reached?");
+		expect(p).toContain('verdict "reached"');
+		expect(p).toContain('verdict "not_reached"');
+	});
+
+	it("tells the model to judge the goal, not the claim", () => {
+		const p = buildEvaluationPrompt(claimingState(0));
+		expect(p).toContain("Judge it against the goal itself, not against the claim");
+	});
+});
+
+describe("buildResumePrompt", () => {
+	it("sends the model back to work with the reason it stayed open", () => {
+		const p = buildResumePrompt(claimingState(1), "the build fails");
+		expect(p).toContain("## Loop — Iteration 2 (not confirmed)");
+		expect(p).toContain("Goal: green tests");
+		expect(p).toContain("The loop is still open: the build fails");
+		expect(p).toContain("The claim was: all tests are green");
+		expect(p).toContain("Keep working on the goal");
+	});
+
+	it("pushes on even when the goal looks unreachable", () => {
+		const p = buildResumePrompt(claimingState(1), "impossible to reach");
+		expect(p).toContain("impossible to reach");
+		expect(p).toContain("If part of it looks unreachable, do what is achievable and keep going");
+		expect(p).toContain("the loop only closes when a claim is confirmed");
+	});
+});
+
 describe("getSystemPromptAddition", () => {
 	it("shows the goal and the iteration", () => {
 		const p = getSystemPromptAddition(goalState());
@@ -113,15 +155,27 @@ describe("getSystemPromptAddition", () => {
 		expect(p).toContain("Call `loop_done` only when the goal is fully met");
 	});
 
-	it("tells the model to end the loop only with a reason", () => {
+	it("tells the model to claim completion only with a reason", () => {
 		const p = getSystemPromptAddition(goalState());
-		expect(p).toContain("records your reason");
+		expect(p).toContain("Call `loop_done` only when the goal is fully met");
 	});
 
 	it("never mentions an advance action", () => {
 		const p = getSystemPromptAddition(goalState());
 		expect(p).not.toMatch(/status\s+"?(next|done)/i);
 		expect(p).not.toMatch(/advance or/i);
+	});
+
+	it("tells the model a claim is confirmed before the loop closes", () => {
+		const p = getSystemPromptAddition(goalState());
+		expect(p).toContain("a claim is confirmed in a follow-up check");
+	});
+
+	it("switches to check instructions while a claim is pending", () => {
+		const p = getSystemPromptAddition(claimingState(1));
+		expect(p).toContain("## Active Loop — Confirmation check");
+		expect(p).toContain("Call `loop_approve` with your verdict");
+		expect(p).not.toContain("loop_done");
 	});
 });
 
@@ -144,6 +198,16 @@ describe("updateWidget", () => {
 		const u = captureUi();
 		updateWidget(goalState(3), u.ctx);
 		expect(u.widget).toEqual(["iter 4 · green tests", "Ctrl+Shift+X to stop"]);
+	});
+
+	it("shows the check phase instead of an iteration", () => {
+		const u = captureUi();
+		updateWidget(claimingState(4), u.ctx);
+		expect(u.status).toBe("loop · evaluating");
+		expect(u.widget).toEqual([
+			"evaluating · green tests",
+			"Ctrl+Shift+X to stop",
+		]);
 	});
 
 	it("uses no emoji or box-drawing characters", () => {

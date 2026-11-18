@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+	getLoopApproveToolDefinition,
 	getLoopDoneToolDefinition,
+	handleLoopApproveTool,
 	handleLoopDoneTool,
+	renderLoopApproveCall,
+	renderLoopApproveResult,
 	renderLoopDoneCall,
 	renderLoopDoneResult,
 } from "../src/tool.ts";
 import type { LoopState } from "../src/state.ts";
-import { foreverState, goalState } from "./helpers.ts";
+import { claimingState, foreverState, goalState } from "./helpers.ts";
 
 describe("handleLoopDoneTool — no active loop", () => {
 	it("returns a no-op result without touching state", () => {
@@ -17,6 +21,8 @@ describe("handleLoopDoneTool — no active loop", () => {
 			done: false,
 			reasonDone: "",
 			forever: false,
+			evaluating: false,
+			claimReason: "",
 		};
 		const r = handleLoopDoneTool({ reason: "x" }, state);
 		expect(r.content[0].text).toBe("No active loop. Start one with /loop.");
@@ -25,30 +31,23 @@ describe("handleLoopDoneTool — no active loop", () => {
 	});
 });
 
-describe("handleLoopDoneTool — ending a loop", () => {
-	it("completes with the justification", () => {
+describe("handleLoopDoneTool — claiming completion", () => {
+	it("records the claim instead of closing the loop", () => {
 		const r = handleLoopDoneTool({ reason: "all green" }, goalState(2));
-		expect(r.newState.done).toBe(true);
-		expect(r.newState.active).toBe(false);
-		expect(r.newState.reasonDone).toBe("all green");
-		expect(r.content[0].text).toContain("Loop complete after 3 iteration(s)");
-		expect(r.content[0].text).toContain("all green");
-		expect(r.details).toMatchObject({ active: false, done: true });
+		expect(r.newState.active).toBe(true);
+		expect(r.newState.done).toBe(false);
+		expect(r.newState.evaluating).toBe(true);
+		expect(r.newState.claimReason).toBe("all green");
+		expect(r.content[0].text).toContain("confirmed in the next turn");
+		expect(r.details).toMatchObject({ evaluating: true });
 	});
 
-	it("trims the justification", () => {
-		const r = handleLoopDoneTool({ reason: "  done  " }, goalState(0));
-		expect(r.newState.reasonDone).toBe("done");
+	it("trims the claim", () => {
+		const r = handleLoopDoneTool({ reason: "  all green  " }, goalState(0));
+		expect(r.newState.claimReason).toBe("all green");
 	});
 
-	it("ends a goal loop", () => {
-		const r = handleLoopDoneTool({ reason: "goal met" }, goalState(4));
-		expect(r.newState.done).toBe(true);
-		expect(r.newState.active).toBe(false);
-		expect(r.content[0].text).toContain("Loop complete after 5 iteration(s)");
-	});
-
-	it("rejects a call without a justification and changes nothing", () => {
+	it("rejects a claim without a justification and changes nothing", () => {
 		const before = goalState(1);
 		const r = handleLoopDoneTool({}, before);
 		expect(r.newState).toBe(before);
@@ -64,50 +63,139 @@ describe("handleLoopDoneTool — ending a loop", () => {
 		expect(r.details).toBeUndefined();
 	});
 
-	it("never advances the loop — the extension owns iteration boundaries", () => {
-		const before = goalState(0);
-		const r = handleLoopDoneTool({ reason: "just because" }, before);
+	it("ignores a second claim while one is being checked", () => {
+		const before = claimingState(1);
+		const r = handleLoopDoneTool({ reason: "really done" }, before);
+		expect(r.newState).toBe(before);
+		expect(r.details).toBeUndefined();
+		expect(r.content[0].text).toContain("already being checked");
+	});
+
+	it("never advances the loop — that is the extension's job", () => {
+		const r = handleLoopDoneTool({ reason: "just because" }, goalState(0));
 		expect(r.newState.currentStep).toBe(0);
-		expect(r.newState.active).toBe(false);
+		expect(r.newState.active).toBe(true);
 	});
 });
 
 describe("handleLoopDoneTool — forever loops", () => {
-	it.each(["next", "done"] as const)(
-		"does not let a stale %s call change state",
-		(status) => {
-			const before = foreverState(5);
-			const r = handleLoopDoneTool({ reason: status }, before);
-			expect(r.newState).toBe(before);
-			expect(r.details).toBeUndefined();
-			expect(r.content[0].text).toBe(
-				"loop_done is unavailable during a forever loop.",
-			);
-		},
-	);
+	it("does not let a stale call change state", () => {
+		const before = foreverState(5);
+		const r = handleLoopDoneTool({ reason: "stale" }, before);
+		expect(r.newState).toBe(before);
+		expect(r.details).toBeUndefined();
+		expect(r.content[0].text).toBe(
+			"loop_done is unavailable during a forever loop.",
+		);
+	});
 });
 
-describe("tool definition", () => {
-	it("registers the loop_control name and description", () => {
-		const def = getLoopDoneToolDefinition();
-		expect(def.name).toBe("loop_done");
-		expect(def.label).toBe("Loop Done");
-		expect(def.description).toContain("End the active loop");
+describe("handleLoopApproveTool — confirming a claim", () => {
+	it("closes the loop when the goal is reached", () => {
+		const r = handleLoopApproveTool(
+			{ verdict: "reached", reason: "verified: tests pass" },
+			claimingState(2),
+		);
+		expect(r.newState.done).toBe(true);
+		expect(r.newState.active).toBe(false);
+		expect(r.newState.evaluating).toBe(false);
+		expect(r.newState.reasonDone).toBe("verified: tests pass");
+		expect(r.content[0].text).toContain("Loop complete after 3 iteration(s)");
+		expect(r.content[0].text).toContain("verified: tests pass");
+		expect(r.details).toMatchObject({ active: false, done: true });
 	});
 
-	it("offers no advance action at all", () => {
-		const def = getLoopDoneToolDefinition();
-		const description = def.description.toLowerCase();
-		expect(description).not.toContain("next");
-		expect(description).not.toContain("advance");
-		expect(description).not.toContain("status");
+	it("falls back to the claim when no reason is given", () => {
+		const r = handleLoopApproveTool({ verdict: "reached" }, claimingState(0));
+		expect(r.newState.reasonDone).toBe("all tests are green");
 	});
 
-	it("requires a reason and nothing else", () => {
+	it("keeps the loop open when the goal is not reached", () => {
+		const r = handleLoopApproveTool(
+			{ verdict: "not_reached", reason: "the build fails" },
+			claimingState(2),
+		);
+		expect(r.newState.active).toBe(true);
+		expect(r.newState.done).toBe(false);
+		expect(r.newState.evaluating).toBe(false);
+		expect(r.content[0].text).toContain("Not confirmed");
+		expect(r.content[0].text).toContain("keep working");
+		expect(r.details).toMatchObject({ active: true, evaluating: false });
+	});
+
+	it("keeps the loop open when no verdict is given at all", () => {
+		const r = handleLoopApproveTool({}, claimingState(0));
+		expect(r.newState.active).toBe(true);
+		expect(r.newState.evaluating).toBe(false);
+	});
+
+	it("keeps the loop open when the model claims the goal is unreachable", () => {
+		const r = handleLoopApproveTool(
+			{ verdict: "not_reached", reason: "impossible to reach" },
+			claimingState(0),
+		);
+		expect(r.newState.active).toBe(true);
+		expect(r.newState.done).toBe(false);
+	});
+
+	it("is a no-op when there is no claim to check", () => {
+		const before = goalState(0);
+		const r = handleLoopApproveTool({ verdict: "reached", reason: "x" }, before);
+		expect(r.newState).toBe(before);
+		expect(r.details).toBeUndefined();
+		expect(r.content[0].text).toContain("only available while a completion claim");
+	});
+
+	it("is a no-op when no loop is active", () => {
+		const before: LoopState = {
+			active: false,
+			currentStep: 0,
+			goal: "",
+			done: false,
+			reasonDone: "",
+			forever: false,
+			evaluating: false,
+			claimReason: "",
+		};
+		const r = handleLoopApproveTool({ verdict: "reached" }, before);
+		expect(r.newState).toBe(before);
+		expect(r.content[0].text).toBe("No active loop. Start one with /loop.");
+	});
+});
+
+describe("tool definitions", () => {
+	it("registers two distinct tools", () => {
+		expect(getLoopDoneToolDefinition().name).toBe("loop_done");
+		expect(getLoopApproveToolDefinition().name).toBe("loop_approve");
+		expect(getLoopDoneToolDefinition().label).toBe("Loop Done");
+		expect(getLoopApproveToolDefinition().label).toBe("Loop Approve");
+	});
+
+	it("offers no advance action on either tool", () => {
+		for (const def of [
+			getLoopDoneToolDefinition(),
+			getLoopApproveToolDefinition(),
+		]) {
+			const description = def.description.toLowerCase();
+			expect(description).not.toContain("next");
+			expect(description).not.toContain("advance");
+			expect(description).not.toContain("status");
+		}
+	});
+
+	it("makes loop_done take a reason and nothing else", () => {
 		const def = getLoopDoneToolDefinition();
-		const props = def.parameters.properties as Record<string, unknown>;
-		expect(Object.keys(props)).toEqual(["reason"]);
+		expect(Object.keys(def.parameters.properties)).toEqual(["reason"]);
 		expect(def.parameters.required).toEqual(["reason"]);
+	});
+
+	it("makes loop_approve take a verdict and a reason", () => {
+		const def = getLoopApproveToolDefinition();
+		expect(Object.keys(def.parameters.properties).sort()).toEqual([
+			"reason",
+			"verdict",
+		]);
+		expect(def.parameters.required?.sort()).toEqual(["reason", "verdict"]);
 	});
 
 	it("folds a legacy done call into the current shape", () => {
@@ -133,14 +221,25 @@ describe("tool definition", () => {
 
 describe("renderers", () => {
 	const theme = {
-		fg: (c: string, t: string) => `<${c}>${t}</${c}>`,
+		fg: (k: string, s: string) => `<${k}>${s}</${k}>`,
 		bold: (s: string) => `**${s}**`,
 	};
 
-	it("renders the call as an end-of-loop action", () => {
+	it("renders the claim call", () => {
 		const r = renderLoopDoneCall({ reason: "goal met" }, theme);
 		expect(r.render(200)[0].startsWith(
-			"<toolTitle>**loop_done **</toolTitle><success>goal met</success>",
+			"<toolTitle>**loop_done **</toolTitle><accent>goal met</accent>",
+		)).toBe(true);
+	});
+
+	it("renders the verdict call", () => {
+		const reached = renderLoopApproveCall({ verdict: "reached" }, theme);
+		expect(reached.render(200)[0].startsWith(
+			"<toolTitle>**loop_approve **</toolTitle><success>reached</success>",
+		)).toBe(true);
+		const notReached = renderLoopApproveCall({ verdict: "not_reached" }, theme);
+		expect(notReached.render(200)[0].startsWith(
+			"<toolTitle>**loop_approve **</toolTitle><warning>not_reached</warning>",
 		)).toBe(true);
 	});
 
@@ -155,12 +254,28 @@ describe("renderers", () => {
 		);
 	});
 
+	it("renders a pending check", () => {
+		const r = renderLoopDoneResult({ details: claimingState(1) }, {}, theme);
+		expect(r.render(200)[0].startsWith("<accent>→ checking</accent>")).toBe(true);
+	});
+
+	it("renders an open loop after a rejection", () => {
+		const r = renderLoopApproveResult(
+			{ details: { ...claimingState(1), evaluating: false } },
+			{},
+			theme,
+		);
+		expect(r.render(200)[0].startsWith("<warning>→ loop still open</warning>")).toBe(
+			true,
+		);
+	});
+
 	it("keeps legacy forever result rendering for old session history", () => {
 		const r = renderLoopDoneResult(
 			{ details: { ...foreverState(3), currentStep: 3 } },
 			{},
 			theme,
 		);
-		expect(r.render(50)[0]).toContain("iter 3 · forever");
+		expect(r.render(200)[0]).toContain("iter 3 · forever");
 	});
 });

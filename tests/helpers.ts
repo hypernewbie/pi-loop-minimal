@@ -16,6 +16,17 @@ export function goalState(step = 0): LoopState {
 		done: false,
 		reasonDone: "",
 		forever: false,
+		evaluating: false,
+		claimReason: "",
+	};
+}
+
+/** A goal loop with a completion claim waiting to be checked. */
+export function claimingState(step = 0): LoopState {
+	return {
+		...goalState(step),
+		evaluating: true,
+		claimReason: "all tests are green",
 	};
 }
 

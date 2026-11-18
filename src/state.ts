@@ -1,8 +1,15 @@
 // state.ts — Types and utilities for the loop extension
 //
 // Two loop forms remain:
-//   /loop goal <description>  — iterate until the model calls loop_done
+//   /loop goal <description>  — iterate until the goal is confirmed
 //   /loop forever <task>      — iterate until the user stops it
+//
+// A goal loop runs in two phases:
+//   working   — the model works; only loop_done is exposed
+//   checking  — the model claimed the goal is met; only loop_approve is
+//               exposed and the claim must be confirmed before the loop
+//               closes. An unconfirmed claim is ignored and the loop
+//               resumes, even when the model says the goal is unreachable.
 //
 // The count form (`/loop <N> <task>`) was removed: with the advance action
 // gone from the model-facing tool, a pass had no meaning beyond "one model
@@ -20,9 +27,13 @@ export interface LoopState {
 	goal: string; // User's description of what we're doing
 	done: boolean; // the loop was closed
 	reasonDone: string; // Why the loop stopped
-	// Endless loop: continuation happens at agent_end, without exposing
-	// loop_done to the model. Only /loop-stop or Ctrl+Shift+X ends it.
+	// Endless loop: continuation happens at agent_end, without exposing any
+	// loop tool to the model. Only /loop-stop or Ctrl+Shift+X ends it.
 	forever: boolean;
+	// Confirmation phase: the model claimed the goal is met and a check turn
+	// is pending. The claim only closes the loop once it is confirmed.
+	evaluating: boolean;
+	claimReason: string; // what the model claimed
 }
 
 export function emptyState(): LoopState {
@@ -33,6 +44,8 @@ export function emptyState(): LoopState {
 		done: false,
 		reasonDone: "",
 		forever: false,
+		evaluating: false,
+		claimReason: "",
 	};
 }
 
@@ -59,6 +72,36 @@ export function buildPrompt(state: LoopState): string {
 	].join("\n");
 }
 
+// The check turn: a claim was made, the model has to judge it against the
+// goal itself. Approval and rejection are both explicit — a claim that is
+// not confirmed leaves the loop open.
+export function buildEvaluationPrompt(state: LoopState): string {
+	return [
+		"## Loop — Confirmation check",
+		`Goal: ${state.goal}`,
+		`A claim was made that the goal is met: ${state.claimReason}`,
+		"",
+		"Has the goal actually been reached? Judge it against the goal itself, not against the claim.",
+		"",
+		'- Call loop_approve with verdict "reached" and your reason if the goal is genuinely done.',
+		'- Call loop_approve with verdict "not_reached" and what is still missing if it is not.',
+	].join("\n");
+}
+
+// The loop stays open: the claim was not confirmed, so the model resumes
+// work. A claim of impossibility is not an exit either.
+export function buildResumePrompt(state: LoopState, why: string): string {
+	return [
+		`## Loop — Iteration ${state.currentStep + 1} (not confirmed)`,
+		`Goal: ${state.goal}`,
+		`The loop is still open: ${why}`,
+		state.claimReason ? `The claim was: ${state.claimReason}` : "",
+		"Keep working on the goal. If part of it looks unreachable, do what is achievable and keep going — the loop only closes when a claim is confirmed.",
+	]
+		.filter(Boolean)
+		.join("\n");
+}
+
 // Argument parsing helpers
 
 export function parseGoalArgs(parts: string[]): LoopState | string {
@@ -73,6 +116,8 @@ export function parseGoalArgs(parts: string[]): LoopState | string {
 		done: false,
 		reasonDone: "",
 		forever: false,
+		evaluating: false,
+		claimReason: "",
 	};
 }
 
@@ -89,6 +134,8 @@ export function parseForeverArgs(parts: string[]): LoopState | string {
 		done: false,
 		reasonDone: "",
 		forever: true,
+		evaluating: false,
+		claimReason: "",
 	};
 }
 
@@ -122,6 +169,15 @@ export function updateWidget(state: LoopState, ctx: ExtensionContext) {
 		return;
 	}
 
+	if (state.evaluating) {
+		ctx.ui.setStatus("loop", "loop · evaluating");
+		ctx.ui.setWidget("loop", [
+			`evaluating · ${state.goal}`,
+			"Ctrl+Shift+X to stop",
+		]);
+		return;
+	}
+
 	const label = `iter ${state.currentStep + 1}`;
 
 	ctx.ui.setStatus("loop", `loop · ${label}`);
@@ -143,6 +199,16 @@ export function getSystemPromptAddition(state: LoopState): string {
 		].join("\n");
 	}
 
+	if (state.evaluating) {
+		return [
+			"",
+			"",
+			"## Active Loop — Confirmation check",
+			`Goal: ${state.goal}`,
+			"A completion claim is being checked. Call `loop_approve` with your verdict.",
+		].join("\n");
+	}
+
 	return [
 		"",
 		"",
@@ -150,6 +216,6 @@ export function getSystemPromptAddition(state: LoopState): string {
 		`Goal: ${state.goal}`,
 		`Iteration: ${state.currentStep + 1}`,
 		"The loop advances automatically when you end your turn.",
-		"Call `loop_done` only when the goal is fully met — it ends the loop and records your reason.",
+		"Call `loop_done` only when the goal is fully met — a claim is confirmed in a follow-up check before the loop closes.",
 	].join("\n");
 }

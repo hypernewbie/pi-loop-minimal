@@ -4,7 +4,7 @@ import extension from "../src/index.ts";
 import type { LoopState } from "../src/state.ts";
 import { foreverState } from "./helpers.ts";
 
-type ToolParams = { reason?: string };
+type ToolParams = { reason?: string; verdict?: string };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: LoopState };
 type CommandCtx = ExtensionContext & { waitForIdle(): Promise<void> };
 type CommandDef = {
@@ -106,7 +106,11 @@ const stopCmd = (h: Harness) => h.commands.get("loop-stop")!;
 const shortcut = (h: Harness) => h.shortcuts.get("ctrl+shift+x")!;
 
 async function execTool(h: Harness, params: ToolParams): Promise<ToolResult> {
-	return h.toolDefs[0].execute("call-1", params, undefined, undefined, h.ctx);
+	return doneTool(h).execute("call-1", params, undefined, undefined, h.ctx);
+}
+
+async function execApprove(h: Harness, params: ToolParams): Promise<ToolResult> {
+	return approveTool(h).execute("call-2", params, undefined, undefined, h.ctx);
 }
 
 /** A normal turn end: the model finished and stopped. */
@@ -120,6 +124,15 @@ async function turnEnd(
 	);
 }
 
+const doneTool = (h: Harness) => h.toolDefs.find((t) => t.name === "loop_done")!;
+const approveTool = (h: Harness) =>
+	h.toolDefs.find((t) => t.name === "loop_approve")!;
+
+const evaluations = (h: Harness) =>
+	h.sentMessages.filter((m) => m.msg.customType === "loop-evaluate");
+const resumes = (h: Harness) =>
+	h.sentMessages.filter((m) => m.msg.customType === "loop-resume");
+
 const iterations = (h: Harness) =>
 	h.sentMessages.filter((m) => m.msg.customType === "loop-iteration");
 const nudges = (h: Harness) =>
@@ -128,12 +141,12 @@ const completions = (h: Harness) =>
 	h.sentMessages.filter((m) => m.msg.customType === "loop-complete");
 
 describe("extension surface", () => {
-	it("registers the loop and loop-stop commands, the tool, and the shortcut", () => {
+	it("registers the loop and loop-stop commands, both tools, and the shortcut", () => {
 		const h = createHarness();
 		expect(h.commands.has("loop")).toBe(true);
 		expect(h.commands.has("loop-stop")).toBe(true);
 		expect(h.shortcuts.has("ctrl+shift+x")).toBe(true);
-		expect(h.toolDefs[0].name).toBe("loop_done");
+		expect(h.toolDefs.map((t) => t.name)).toEqual(["loop_done", "loop_approve"]);
 	});
 
 	it("listens only to current-Pi events", () => {
@@ -258,15 +271,76 @@ describe("/loop command", () => {
 	});
 });
 
-describe("loop_done ends the loop", () => {
-	it("ends the loop with the model's justification", async () => {
+describe("loop_done claims completion", () => {
+	it("records the claim and asks for confirmation instead of closing", async () => {
 		const h = createHarness();
 		await loopCmd(h).handler("goal win", h.ctx);
 		const r = await execTool(h, { reason: "all tests pass" });
+		expect(r.details).toMatchObject({ active: true, done: false, evaluating: true });
+		expect(r.content[0].text).toContain("confirmed in the next turn");
+		expect(evaluations(h)).toHaveLength(1);
+		expect(evaluations(h)[0].msg.content).toContain("Has the goal actually been reached?");
+		expect(h.ui.setStatus).toHaveBeenLastCalledWith("loop", "loop · evaluating");
+	});
+
+	it("exposes only loop_approve while the claim is being checked", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal win", h.ctx);
+		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
+		await execTool(h, { reason: "all tests pass" });
+		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).toContain("loop_approve");
+	});
+
+	it("closes the loop when the claim is confirmed", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal win", h.ctx);
+		await execTool(h, { reason: "all tests pass" });
+		const r = await execApprove(h, { verdict: "reached", reason: "verified" });
 		expect(r.content[0].text).toContain("Loop complete after 1 iteration(s)");
-		expect(r.content[0].text).toContain("all tests pass");
+		expect(r.content[0].text).toContain("verified");
 		expect(r.details).toMatchObject({ active: false, done: true });
 		expect(h.ui.setWidget).toHaveBeenLastCalledWith("loop", undefined);
+		// no loop tool is exposed once the loop is over
+		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
+	});
+
+	it("keeps the loop open when the claim is rejected", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal win", h.ctx);
+		await execTool(h, { reason: "all tests pass" });
+		const r = await execApprove(h, { verdict: "not_reached", reason: "the build fails" });
+		expect(r.details).toMatchObject({ active: true, done: false, evaluating: false });
+		expect(resumes(h)).toHaveLength(1);
+		expect(resumes(h)[0].msg.content).toContain("the build fails");
+		expect(resumes(h)[0].msg.content).toContain("Keep working on the goal");
+		// the work tool comes back, the approval tool goes away
+		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
+	});
+
+	it("keeps the loop open when the model claims the goal is unreachable", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal win", h.ctx);
+		await execTool(h, { reason: "all tests pass" });
+		const r = await execApprove(h, { verdict: "not_reached", reason: "impossible to reach" });
+		expect(r.details).toMatchObject({ active: true, done: false });
+		expect(resumes(h)[0].msg.content).toContain("impossible to reach");
+		expect(resumes(h)[0].msg.content).toContain("do what is achievable and keep going");
+	});
+
+	it("resumes when the check turn ends without a verdict", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal win", h.ctx);
+		await execTool(h, { reason: "all tests pass" });
+		// the model ends the check turn without calling loop_approve
+		await turnEnd(h);
+		expect(resumes(h)).toHaveLength(1);
+		expect(resumes(h)[0].msg.content).toContain("the claim was not confirmed");
+		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
 	});
 
 	it("never advances the loop — that is the extension's job", async () => {
@@ -274,10 +348,8 @@ describe("loop_done ends the loop", () => {
 		await loopCmd(h).handler("goal x", h.ctx);
 		await turnEnd(h);
 		expect(iterations(h)).toHaveLength(1);
-		const r = await execTool(h, { reason: "stopping early" });
-		expect(r.content[0].text).toContain("Loop complete after 2 iteration(s)");
-		// ending the loop must not steer another iteration
-		expect(iterations(h)).toHaveLength(1);
+		const r = await execTool(h, { reason: "claiming" });
+		expect(r.details?.currentStep).toBe(1);
 	});
 
 	it("is a no-op when no loop is active", async () => {
@@ -293,9 +365,7 @@ describe("loop_done ends the loop", () => {
 		const r = await execTool(h, {});
 		expect(r.content[0].text).toContain("needs a reason");
 		expect(r.details).toBeUndefined();
-		await turnEnd(h);
-		// the loop is still running
-		expect(iterations(h)).toHaveLength(1);
+		expect(evaluations(h)).toHaveLength(0);
 	});
 
 	it("does not persist a rejected call", async () => {
@@ -304,6 +374,33 @@ describe("loop_done ends the loop", () => {
 		const before = h.branch.length;
 		await execTool(h, {});
 		expect(h.branch.length).toBe(before);
+	});
+
+	it("blocks a stale loop_done while a claim is being checked", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal x", h.ctx);
+		await execTool(h, { reason: "claiming" });
+		const blocked = h.handlers.get("tool_call")!(
+			{ toolName: "loop_done" },
+			h.ctx,
+		);
+		expect(blocked).toEqual({
+			block: true,
+			reason: "loop_done is unavailable while a completion claim is being checked.",
+		});
+	});
+
+	it("blocks a stale loop_approve outside the check phase", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal x", h.ctx);
+		const blocked = h.handlers.get("tool_call")!(
+			{ toolName: "loop_approve" },
+			h.ctx,
+		);
+		expect(blocked).toEqual({
+			block: true,
+			reason: "loop_approve is only available while a completion claim is being checked.",
+		});
 	});
 });
 
@@ -721,6 +818,68 @@ describe("before_agent_start", () => {
 			h.ctx,
 		);
 		expect(r).toBeUndefined();
+	});
+});
+
+describe("tool exposure", () => {
+	it("exposes no loop tool before a loop starts", async () => {
+		const h = createHarness();
+		await h.handlers.get("session_start")!({}, h.ctx);
+		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
+	});
+
+	it("exposes no loop tool once the loop is over", async () => {
+		const h = createHarness();
+		await h.handlers.get("session_start")!({}, h.ctx);
+		await loopCmd(h).handler("goal x", h.ctx);
+		expect(h.activeTools()).toContain("loop_done");
+		await execTool(h, { reason: "claiming" });
+		await execApprove(h, { verdict: "reached", reason: "verified" });
+		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
+	});
+
+	it("exposes no loop tool after /loop-stop", async () => {
+		const h = createHarness();
+		await h.handlers.get("session_start")!({}, h.ctx);
+		await loopCmd(h).handler("goal x", h.ctx);
+		await stopCmd(h).handler("", h.ctx);
+		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
+	});
+
+	it("exposes no loop tool for a forever loop", async () => {
+		const h = createHarness();
+		await h.handlers.get("session_start")!({}, h.ctx);
+		await loopCmd(h).handler("forever x", h.ctx);
+		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
+	});
+
+	it("drops a pending claim when the session is restored", async () => {
+		const h = createHarness();
+		h.branch.push({
+			type: "custom",
+			customType: "loop-state",
+			data: {
+				active: true,
+				currentStep: 2,
+				goal: "restored",
+				done: false,
+				reasonDone: "",
+				forever: false,
+				evaluating: true,
+				claimReason: "claimed before the restart",
+			},
+		});
+		await h.handlers.get("session_start")!({}, h.ctx);
+		// back to working: only loop_done is exposed, and the claim is gone
+		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_approve");
+		await turnEnd(h);
+		expect(evaluations(h)).toHaveLength(0);
+		expect(iterations(h)).toHaveLength(1);
 	});
 });
 

@@ -20,8 +20,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import {
+	buildEvaluationPrompt,
 	buildNudgePrompt,
 	buildPrompt,
+	buildResumePrompt,
 	emptyState,
 	getSystemPromptAddition,
 	type LoopState,
@@ -30,9 +32,14 @@ import {
 	updateWidget,
 } from "./state.js";
 import {
+	getLoopApproveToolDefinition,
 	getLoopDoneToolDefinition,
+	handleLoopApproveTool,
 	handleLoopDoneTool,
+	LOOP_APPROVE_TOOL,
 	LOOP_DONE_TOOL,
+	renderLoopApproveCall,
+	renderLoopApproveResult,
 	renderLoopDoneCall,
 	renderLoopDoneResult,
 } from "./tool.js";
@@ -48,24 +55,36 @@ export default function (pi: ExtensionAPI) {
 	// no longer advance a loop, so there is no tool result to reconstruct from.
 	const persist = (s: LoopState) => pi.appendEntry(STATE_ENTRY, { ...s });
 
-	// Derive each change from Pi's current list: never restore a stale snapshot
-	// and accidentally overwrite tool choices made by the user or extensions.
-	const setLoopDoneActive = (active: boolean) => {
+	// Exactly one loop tool is exposed at a time, and none when there is no
+	// loop to drive. Derive each change from Pi's current list: never restore
+	// a stale snapshot and accidentally overwrite tool choices made by the
+	// user or other extensions.
+	const applyLoopTools = () => {
 		const tools = pi.getActiveTools();
-		const hasTool = tools.includes(LOOP_DONE_TOOL);
-		if (active === hasTool) return;
-		pi.setActiveTools(
-			active
-				? [...new Set([...tools, LOOP_DONE_TOOL])]
-				: tools.filter((name) => name !== LOOP_DONE_TOOL),
+		const withoutLoopTools = tools.filter(
+			(name) => name !== LOOP_DONE_TOOL && name !== LOOP_APPROVE_TOOL,
 		);
+		const wanted = !state.active
+			? []
+			: state.forever
+				? []
+				: state.evaluating
+					? [LOOP_APPROVE_TOOL]
+					: [LOOP_DONE_TOOL];
+		const next = [...withoutLoopTools, ...wanted];
+		if (next.length === tools.length && next.every((n, i) => n === tools[i])) {
+			return;
+		}
+		pi.setActiveTools(next);
 	};
 
 	const stopLoop = (reason: string, ctx: ExtensionContext) => {
 		state.active = false;
 		state.done = true;
 		state.reasonDone = reason;
+		state.evaluating = false;
 		pi.appendEntry(STOP_ENTRY, { reason });
+		applyLoopTools();
 		updateWidget(state, ctx);
 	};
 
@@ -85,6 +104,10 @@ export default function (pi: ExtensionAPI) {
 			done: d.done === true,
 			reasonDone: typeof d.reasonDone === "string" ? d.reasonDone : "",
 			forever: d.forever === true,
+			// A pending check does not survive a restart: the claim it belonged
+			// to is dropped, and the loop goes back to working.
+			evaluating: false,
+			claimReason: "",
 		};
 	};
 
@@ -123,7 +146,10 @@ export default function (pi: ExtensionAPI) {
 				if (restored) state = restored;
 			}
 		}
-		if (state.active && state.forever) setLoopDoneActive(false);
+		// Exactly one loop tool is exposed while a loop runs, and none when
+		// there is no loop: registered tools are active by default, so both
+		// loop tools have to be taken out of the list here.
+		applyLoopTools();
 		updateWidget(state, ctx);
 	};
 
@@ -133,10 +159,27 @@ export default function (pi: ExtensionAPI) {
 	// Tool removal applies to future model requests. Block a call that was
 	// already issued by a stale/queued request before the removal took effect.
 	pi.on("tool_call", (event) => {
-		if (state.active && state.forever && event.toolName === LOOP_DONE_TOOL) {
+		// Only the tool of the current phase may run. The active-tool list
+		// already hides the other one; this covers a call that was issued
+		// before the swap took effect.
+		if (event.toolName === LOOP_DONE_TOOL) {
+			if (state.forever) {
+				return {
+					block: true,
+					reason: "loop_done is unavailable during a forever loop.",
+				};
+			}
+			if (state.evaluating) {
+				return {
+					block: true,
+					reason: "loop_done is unavailable while a completion claim is being checked.",
+				};
+			}
+		}
+		if (event.toolName === LOOP_APPROVE_TOOL && !state.evaluating) {
 			return {
 				block: true,
-				reason: "loop_done is unavailable during a forever loop.",
+				reason: "loop_approve is only available while a completion claim is being checked.",
 			};
 		}
 	});
@@ -157,7 +200,7 @@ export default function (pi: ExtensionAPI) {
 		if (stopReason === "aborted" || stopReason === "error") return;
 
 		if (state.forever) {
-			setLoopDoneActive(false);
+			applyLoopTools();
 			pi.sendMessage(
 				{
 					customType: "loop-nudge",
@@ -166,6 +209,13 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
+			return;
+		}
+
+		// A check turn that ended without a verdict: the claim is ignored and
+		// the work resumes — whatever the model said about the goal.
+		if (state.evaluating) {
+			resumeLoop("the claim was not confirmed", ctx);
 			return;
 		}
 
@@ -184,7 +234,23 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	// ── Tool: the LLM calls this to end the loop, with a reason ─────────
+	// ── Resume: the claim was not confirmed, so the loop keeps working ──
+	const resumeLoop = (why: string, ctx: ExtensionContext) => {
+		state = { ...state, evaluating: false };
+		persist(state);
+		applyLoopTools();
+		updateWidget(state, ctx);
+		pi.sendMessage(
+			{
+				customType: "loop-resume",
+				content: buildResumePrompt(state, why),
+				display: false,
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	};
+
+	// ── Tool: the LLM claims the goal is met ───────────────────────────
 	pi.registerTool({
 		...getLoopDoneToolDefinition(),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -193,7 +259,19 @@ export default function (pi: ExtensionAPI) {
 			// Only a real state change is persisted, so a rejected call cannot
 			// resurrect a stopped loop on the next reconstruction.
 			if (result.details) persist(state);
+			applyLoopTools();
 			updateWidget(state, ctx);
+			// A claim does not close the loop: the next turn checks it.
+			if (state.evaluating) {
+				pi.sendMessage(
+					{
+						customType: "loop-evaluate",
+						content: buildEvaluationPrompt(state),
+						display: false,
+					},
+					{ triggerTurn: true, deliverAs: "steer" },
+				);
+			}
 			return {
 				content: result.content,
 				details: result.details,
@@ -201,6 +279,34 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderCall: renderLoopDoneCall,
 		renderResult: renderLoopDoneResult,
+	});
+
+	// ── Tool: the LLM confirms (or rejects) the claim ───────────────────
+	pi.registerTool({
+		...getLoopApproveToolDefinition(),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const wasEvaluating = state.evaluating;
+			const result = handleLoopApproveTool(params, state);
+			state = result.newState;
+			if (result.details) persist(state);
+			applyLoopTools();
+			updateWidget(state, ctx);
+			// Rejected: the loop stays open and the work resumes.
+			if (wasEvaluating && !state.evaluating && state.active) {
+				resumeLoop(
+					typeof params.reason === "string" && params.reason.trim()
+						? params.reason.trim()
+						: "the goal was not confirmed",
+					ctx,
+				);
+			}
+			return {
+				content: result.content,
+				details: result.details,
+			};
+		},
+		renderCall: renderLoopApproveCall,
+		renderResult: renderLoopApproveResult,
 	});
 
 	// ── Inject loop context into the system prompt ───────────────────────
@@ -275,9 +381,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			state = result;
-			// Forever loops are driven solely by agent_end, so their model request
-			// must not receive loop_done. Normal loop forms opt it back in.
-			setLoopDoneActive(!state.forever);
+			// Exactly one loop tool is exposed, and only while a loop runs.
+			applyLoopTools();
 			persist(state);
 			updateWidget(state, ctx);
 			// Kick off the first work session/iteration.

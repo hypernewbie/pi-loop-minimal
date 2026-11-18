@@ -7,14 +7,15 @@ you stop it. A trimmed, modernized port of
 
 ## What it does
 
-- **Goal loops** — `/loop goal <description>`: iterate until the model calls
-  `loop_done`. Open-ended: there is no iteration cap, matching the original
-  behavior.
+- **Goal loops** — `/loop goal <description>`: iterate until the model *claims*
+  the goal is met **and** a confirmation check agrees. Open-ended: there is no
+  iteration cap, matching the original behavior.
 - **Forever loops** — `/loop forever <task>`: the model does not receive
   `loop_done`; ending a turn starts another work turn until **you** stop it.
-- **One tool, one job**: `loop_done` only ends a loop, with a reason. The
+- **Two tools, one at a time**: `loop_done` (working) and `loop_approve`
+  (confirmation). Exactly one is exposed, and only while a loop runs. The
   extension owns iteration boundaries — a turn that ends advances the loop.
-  Forever loops do not get the tool at all.
+  Forever loops get neither.
 - **Turn-driven iterations**: when the model ends a turn with the loop still
   open, the loop steers the next iteration immediately (`triggerTurn`), so a
   turn can never silently stall the loop. Runs the user aborted (`Esc`) or that
@@ -50,14 +51,17 @@ pi install git:github.com/hypernewbie/pi-loop-minimal
 
 1. `/loop …` waits for idle, then kicks off the first work turn as a user
    message built from the loop prompt.
-2. The model works. `loop_done` is available in goal loops and does exactly one
-   thing: end the loop, with a reason.
+2. The model works. In a goal loop `loop_done` is exposed and does exactly one
+   thing: claim the goal is met, with a reason.
 3. When the model ends its turn with the loop still open, the extension
    advances it — the next iteration is dispatched as a hidden steer message.
    In forever loops the same turn-end injects a continuation instead, because
    a forever loop has no iteration count.
+4. A `loop_done` claim does **not** close the loop. It opens a confirmation
+   phase: the next turn asks whether the goal has actually been reached, and
+   only `loop_approve` is exposed then.
 
-Goal loops are unbounded: they end when the model calls `loop_done` or the user
+Goal loops are unbounded: they end when a claim is **confirmed**, or when the user
 stops them. There is no count form — a pass had no meaning once the model
 could no longer advance the loop itself.
 
@@ -82,15 +86,60 @@ Stopping is yours alone:
 | `Esc` | Aborts the current turn only — the loop stays armed and the next turn end resumes it |
 | model tries `loop_done` | Blocked as a stale call; no state changes |
 
-`loop_done` itself has one action in every loop that exposes it:
+## Confirmation
+
+A goal loop closes only when a claim survives a check.
 
 ```text
-loop_done(reason: "all tests green")
+loop_done(reason: "all tests green")     # working phase: a claim
+loop_approve(verdict, reason)            # check phase: the verdict
 ```
 
-It ends the loop and records the reason. It has no advance action, so a model
-cannot manufacture progress by calling it repeatedly — ending the loop early is
-the only thing it can do.
+1. **Working phase.** Only `loop_done` is exposed. The model claims the goal
+   is met.
+2. **Check phase.** The next turn is prompted with *“Has the goal actually
+   been reached? Judge it against the goal itself, not against the claim.”*
+   Only `loop_approve` is exposed now — `loop_done` is taken out of the
+   active-tool list.
+3. **Verdict.**
+   - `verdict: "reached"` → the loop closes and the reason is recorded.
+   - `verdict: "not_reached"` → the claim is ignored and the work resumes.
+   - No `loop_approve` call at all → the claim is ignored and the work
+     resumes.
+
+A rejected claim comes back as a work prompt, not as a verdict:
+
+```text
+## Loop — Iteration 4 (not confirmed)
+Goal: all tests green
+The loop is still open: the build fails
+The claim was: all tests green
+Keep working on the goal. If part of it looks unreachable, do what is
+achievable and keep going — the loop only closes when a claim is confirmed.
+```
+
+That last line is the point: **a claim of impossibility is not an exit**. The
+loop only closes on a confirmed claim, so a model that gives up on the goal
+gets sent back to work instead of ending the run.
+
+`loop_approve` takes an explicit `verdict` because a rejection spoken through
+the tool (`reason: "impossible to reach"`) would otherwise read as an
+approval — exactly the false completion this check exists to catch.
+
+### Tool exposure
+
+Exactly one loop tool is exposed at a time, and none when no loop runs:
+
+| State | Exposed |
+|---|---|
+| no loop | neither |
+| goal loop, working | `loop_done` |
+| goal loop, checking a claim | `loop_approve` |
+| forever loop | neither |
+
+The active-tool list is derived from Pi's current list each time, so tool
+choices made by you or by other extensions are preserved. A `tool_call` gate
+covers a call that was already issued before the swap took effect.
 
 Every state change writes a durable `loop-state` entry and both stop paths write
 `loop-stopped` via `pi.appendEntry`. Thus a loop can resume after a restart —
@@ -104,8 +153,10 @@ pass 3/5 · refine the renderer
 Ctrl+Shift+X to stop
 ```
 
-Footer status is `loop · iter 3` (goal mode) or `loop · forever`. A tool result
-renders as `✓ loop complete`; forever loops produce no tool result at all.
+Footer status is `loop · iter 3` (goal mode), `loop · evaluating` (while a claim
+is being checked), or `loop · forever`. A tool result renders as
+`✓ loop complete` or `→ checking`; forever loops produce no tool result at
+all.
 
 ## What changed from pi-agent-loop
 
@@ -129,13 +180,16 @@ renders as `✓ loop complete`; forever loops produce no tool result at all.
 - **Tool-free forever loops**: `/loop forever <task>` removes
   `loop_done` while active and continues only from `agent_end`, so a badly
   behaving model cannot manufacture progress with repeated `next` calls.
-- **One verb, renamed**: the tool is `loop_done` and only ends a loop, with a
-  reason. The `next` status is gone from the schema, the tool description,
-  every prompt, and the system prompt. The extension advances the loop when a
-  turn ends, so the model can no longer call its own iterations. Legacy
-  `{ status: "done" }` calls from older sessions are folded into the new shape;
-  a legacy `{ status: "next" }` call is rejected instead of silently ending
-  the loop.
+- **One verb, renamed**: the tool is `loop_done` and only claims completion,
+  with a reason. The `next` status is gone from the schema, the tool
+  description, every prompt, and the system prompt. The extension advances the
+  loop when a turn ends, so the model can no longer call its own iterations.
+  Legacy `{ status: "done" }` calls from older sessions are folded into the new
+  shape; a legacy `{ status: "next" }` call is rejected instead of silently
+  ending the loop.
+- **Confirmation before closing**: a `loop_done` claim is checked in the next
+  turn by `loop_approve`, and an unconfirmed claim resumes the loop instead of
+  closing it. Exactly one loop tool is exposed at a time.
 - **No count form**: `/loop <N> <task>` is gone. With the advance action
   removed, a "pass" was only "one model turn", and a loop that ends when the
   goal is met is the useful case. The command points at what is left instead
@@ -156,14 +210,15 @@ intentional exception: it has its own tool-free prompt and continuation.
 
 ```bash
 npm install
-npm test          # vitest — 105 tests
+npm test          # vitest — 136 tests
 npm run typecheck # tsc --noEmit (src + tests)
 npm pack --dry-run
 ```
 
-The tests cover parsing, prompts, turn-end transitions, the single-verb tool,
-renderers, command dispatch, stop controls, and session reconstruction through
-a fake `ExtensionAPI` harness.
+The tests cover parsing, prompts, turn-end transitions, the claim and
+confirmation phases, tool exposure per phase, renderers, command dispatch,
+stop controls, and session reconstruction through a fake `ExtensionAPI`
+harness.
 
 ## Provenance and license
 
