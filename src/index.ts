@@ -1,19 +1,18 @@
 // index.ts — Minimal agent loop extension
 // Loop forms:
 //   /loop goal <description>  — repeat until the LLM declares the goal met
-//   /loop <N> <task>          — repeat exactly N times
 //   /loop forever <task>      — continue until the user stops it
 //
 // The extension owns iteration boundaries: a turn that ends advances the
-// loop. `loop_control` can only end a loop, with a reason. Forever loops do
+// loop. `loop_done` can only end a loop, with a reason. Forever loops do
 // not expose the tool at all.
 // Ctrl+Shift+X to abort at any time.
 //
 // Ported from pi-agent-loop@0.1.1 (MIT). Changes from the original:
 // the `passes`/`pipeline` modes and the dead `session_switch`/`session_fork`
 // events are removed, the no-op `agent_end` handler was replaced by the
-// force-close nudge below, and the `/loop` command now takes `<N>`
-// directly instead of `passes <N>`.
+// turn-end advance below, the `/loop` command now takes `<N>` directly
+// instead of `passes <N>`, and the count form was later dropped.
 
 import type {
 	ExtensionAPI,
@@ -28,20 +27,19 @@ import {
 	type LoopState,
 	parseForeverArgs,
 	parseGoalArgs,
-	parsePassesArgs,
 	updateWidget,
 } from "./state.js";
 import {
-	getLoopControlToolDefinition,
-	handleLoopControlTool,
-	renderLoopControlCall,
-	renderLoopControlResult,
+	getLoopDoneToolDefinition,
+	handleLoopDoneTool,
+	LOOP_DONE_TOOL,
+	renderLoopDoneCall,
+	renderLoopDoneResult,
 } from "./tool.js";
 
 export default function (pi: ExtensionAPI) {
 	let state = emptyState();
 
-	const LOOP_CONTROL_TOOL = "loop_control";
 	const STATE_ENTRY = "loop-state";
 	const LEGACY_START_ENTRY = "loop-started";
 	const STOP_ENTRY = "loop-stopped";
@@ -52,14 +50,14 @@ export default function (pi: ExtensionAPI) {
 
 	// Derive each change from Pi's current list: never restore a stale snapshot
 	// and accidentally overwrite tool choices made by the user or extensions.
-	const setLoopControlActive = (active: boolean) => {
+	const setLoopDoneActive = (active: boolean) => {
 		const tools = pi.getActiveTools();
-		const hasControl = tools.includes(LOOP_CONTROL_TOOL);
-		if (active === hasControl) return;
+		const hasTool = tools.includes(LOOP_DONE_TOOL);
+		if (active === hasTool) return;
 		pi.setActiveTools(
 			active
-				? [...new Set([...tools, LOOP_CONTROL_TOOL])]
-				: tools.filter((name) => name !== LOOP_CONTROL_TOOL),
+				? [...new Set([...tools, LOOP_DONE_TOOL])]
+				: tools.filter((name) => name !== LOOP_DONE_TOOL),
 		);
 	};
 
@@ -72,6 +70,24 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// ── Reconstruct state from session branch ────────────────────────────
+	// Older entries carry fields this version dropped (mode, maxSteps) and may
+	// miss fields entirely, so every field is normalized here: restoring a
+	// missing field as undefined turns arithmetic on it into NaN.
+	const restoreState = (data: unknown): LoopState | null => {
+		if (!data || typeof data !== "object") return null;
+		const d = data as Record<string, unknown>;
+		const step = d.currentStep;
+		return {
+			active: d.active === true,
+			currentStep:
+				typeof step === "number" && Number.isFinite(step) ? step : 0,
+			goal: typeof d.goal === "string" ? d.goal : "",
+			done: d.done === true,
+			reasonDone: typeof d.reasonDone === "string" ? d.reasonDone : "",
+			forever: d.forever === true,
+		};
+	};
+
 	const reconstruct = (ctx: ExtensionContext) => {
 		state = emptyState();
 		for (const entry of ctx.sessionManager.getBranch()) {
@@ -82,8 +98,8 @@ export default function (pi: ExtensionAPI) {
 				(entry.customType === STATE_ENTRY ||
 					entry.customType === LEGACY_START_ENTRY)
 			) {
-				const d = entry.data as Partial<LoopState> | undefined;
-				if (d) state = { ...emptyState(), ...d };
+				const restored = restoreState(entry.data);
+				if (restored) state = restored;
 				continue;
 			}
 			if (entry.type === "custom" && entry.customType === STOP_ENTRY) {
@@ -98,15 +114,16 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (entry.type !== "message") continue;
 			const msg = entry.message;
-			if (msg.role === "toolResult" && msg.toolName === "loop_control") {
-				const d = msg.details as Partial<LoopState> | undefined;
-				// Spread over defaults: details written by an older version can be
-				// missing fields, and restoring them as undefined turns arithmetic
-				// on them into NaN (the same trap as Infinity -> null for maxSteps).
-				if (d) state = { ...emptyState(), ...d };
+			// Legacy sessions stored the state in loop_control tool results.
+			if (
+				msg.role === "toolResult" &&
+				(msg.toolName === "loop_control" || msg.toolName === LOOP_DONE_TOOL)
+			) {
+				const restored = restoreState(msg.details);
+				if (restored) state = restored;
 			}
 		}
-		if (state.active && state.forever) setLoopControlActive(false);
+		if (state.active && state.forever) setLoopDoneActive(false);
 		updateWidget(state, ctx);
 	};
 
@@ -116,14 +133,10 @@ export default function (pi: ExtensionAPI) {
 	// Tool removal applies to future model requests. Block a call that was
 	// already issued by a stale/queued request before the removal took effect.
 	pi.on("tool_call", (event) => {
-		if (
-			state.active &&
-			state.forever &&
-			event.toolName === LOOP_CONTROL_TOOL
-		) {
+		if (state.active && state.forever && event.toolName === LOOP_DONE_TOOL) {
 			return {
 				block: true,
-				reason: "loop_control is unavailable during a forever loop.",
+				reason: "loop_done is unavailable during a forever loop.",
 			};
 		}
 	});
@@ -144,7 +157,7 @@ export default function (pi: ExtensionAPI) {
 		if (stopReason === "aborted" || stopReason === "error") return;
 
 		if (state.forever) {
-			setLoopControlActive(false);
+			setLoopDoneActive(false);
 			pi.sendMessage(
 				{
 					customType: "loop-nudge",
@@ -158,26 +171,7 @@ export default function (pi: ExtensionAPI) {
 
 		// The turn ended, so that iteration is over. The extension owns the
 		// boundary — the model cannot advance the loop itself.
-		const completed = state.currentStep + 1;
-		if (state.mode === "passes" && completed >= (state.maxSteps ?? 0)) {
-			state = {
-				...state,
-				currentStep: completed,
-				done: true,
-				active: false,
-				reasonDone: "Completed all passes",
-			};
-			persist(state);
-			updateWidget(state, ctx);
-			pi.sendMessage({
-				customType: "loop-complete",
-				content: `✓ Loop complete — all ${state.maxSteps} passes done.`,
-				display: true,
-			});
-			return;
-		}
-
-		state = { ...state, currentStep: completed };
+		state = { ...state, currentStep: state.currentStep + 1 };
 		persist(state);
 		updateWidget(state, ctx);
 		pi.sendMessage(
@@ -192,9 +186,9 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Tool: the LLM calls this to end the loop, with a reason ─────────
 	pi.registerTool({
-		...getLoopControlToolDefinition(),
+		...getLoopDoneToolDefinition(),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const result = handleLoopControlTool(params, state);
+			const result = handleLoopDoneTool(params, state);
 			state = result.newState;
 			// Only a real state change is persisted, so a rejected call cannot
 			// resurrect a stopped loop on the next reconstruction.
@@ -205,8 +199,8 @@ export default function (pi: ExtensionAPI) {
 				details: result.details,
 			};
 		},
-		renderCall: renderLoopControlCall,
-		renderResult: renderLoopControlResult,
+		renderCall: renderLoopDoneCall,
+		renderResult: renderLoopDoneResult,
 	});
 
 	// ── Inject loop context into the system prompt ───────────────────────
@@ -220,7 +214,7 @@ export default function (pi: ExtensionAPI) {
 	// ── /loop command — start a loop ─────────────────────────────────────
 	pi.registerCommand("loop", {
 		description:
-			"Start a loop. Usage: /loop goal <desc> | /loop forever <task> | /loop <N> <task>",
+			"Start a loop. Usage: /loop goal <desc> | /loop forever <task>",
 		getArgumentCompletions: (prefix: string) => {
 			// Filter by the current argument: once the user types the goal
 			// text, the completion must disappear so accepting it cannot
@@ -244,7 +238,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!args?.trim()) {
 				ctx.ui.notify(
-					"Usage:\n  /loop goal <description>\n  /loop forever <task>\n  /loop <N> <task>",
+					"Usage:\n  /loop goal <description>\n  /loop forever <task>",
 					"info",
 				);
 				return;
@@ -261,11 +255,15 @@ export default function (pi: ExtensionAPI) {
 				result = parseGoalArgs(parts);
 			} else if (mode === "forever") {
 				result = parseForeverArgs(parts);
-			} else if (/^\d+$/.test(mode)) {
-				result = parsePassesArgs(parts);
+			} else if (/^\d+$/.test(mode) || mode === "passes") {
+				ctx.ui.notify(
+					"Exact-count loops were removed. Use /loop goal <description> (ends when the goal is met) or /loop forever <task> (ends when you stop it).",
+					"error",
+				);
+				return;
 			} else {
 				ctx.ui.notify(
-					`Unknown mode "${mode}". Use: goal, forever, or <N> for an exact-count loop`,
+					`Unknown mode "${mode}". Use: goal or forever`,
 					"error",
 				);
 				return;
@@ -278,8 +276,8 @@ export default function (pi: ExtensionAPI) {
 
 			state = result;
 			// Forever loops are driven solely by agent_end, so their model request
-			// must not receive loop_control. Normal loop forms opt it back in.
-			setLoopControlActive(!state.forever);
+			// must not receive loop_done. Normal loop forms opt it back in.
+			setLoopDoneActive(!state.forever);
 			persist(state);
 			updateWidget(state, ctx);
 			// Kick off the first work session/iteration.

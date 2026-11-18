@@ -1,7 +1,7 @@
 {
   "name": "pi-loop-minimal",
-  "version": "0.6.0",
-  "description": "Minimal agent loops for pi: goal, forever, and exact-count forms",
+  "version": "0.7.0",
+  "description": "Minimal agent loops for pi: goal and forever forms",
   "type": "module",
   "keywords": [
     "pi-package",

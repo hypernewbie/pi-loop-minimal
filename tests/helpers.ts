@@ -8,25 +8,10 @@ export function parseOk(s: LoopState | string): LoopState {
 	return s;
 }
 
-export function countState(step: number, max: number): LoopState {
-	return {
-		active: true,
-		mode: "passes",
-		currentStep: step,
-		maxSteps: max,
-		goal: "task",
-		done: false,
-		reasonDone: "",
-		forever: false,
-	};
-}
-
 export function goalState(step = 0): LoopState {
 	return {
 		active: true,
-		mode: "goal",
 		currentStep: step,
-		maxSteps: null,
 		goal: "green tests",
 		done: false,
 		reasonDone: "",
