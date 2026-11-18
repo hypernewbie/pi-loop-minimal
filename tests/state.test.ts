@@ -106,7 +106,7 @@ describe("buildPrompt", () => {
 		expect(p).toContain("## Loop — Pass 1 of 3");
 		expect(p).toContain("Task: polish the docs");
 		expect(p).toContain("This is the first pass.");
-		expect(p).toContain('status "next"');
+		expect(p).toContain("Each pass ends when you end your turn");
 	});
 
 	it("labels a middle count pass as refinement", () => {
@@ -115,19 +115,27 @@ describe("buildPrompt", () => {
 		expect(mid).toContain("This is a refinement pass.");
 	});
 
-	it("labels the final count pass and asks for done", () => {
+	it("labels the final count pass as ending on turn end", () => {
 		const last = buildPrompt(countState(2, 3));
 		expect(last).toContain("## Loop — Pass 3 of 3");
 		expect(last).toContain("This is the **final pass**.");
-		expect(last).toContain('call loop_control with status "done"');
+		expect(last).toContain("then end your turn — the loop completes on its own");
 	});
 
 	it("builds an open-ended goal iteration prompt", () => {
 		const p = buildPrompt(goalState());
 		expect(p).toContain("## Loop — Iteration 1");
 		expect(p).toContain("Goal: green tests");
-		expect(p).toContain('status "done" and explain why');
-		expect(p).toContain('status "next" describing what\'s left');
+		expect(p).toContain("Each iteration ends when you end your turn");
+		expect(p).toContain("call loop_control and give the reason why");
+	});
+
+	it("offers the model no advance action in any prompt", () => {
+		for (const s of [goalState(), countState(1, 3)]) {
+			const p = buildPrompt(s);
+			expect(p).not.toMatch(/status\s+"?(next|done)/i);
+			expect(p).not.toMatch(/loop_control[^.]*\bnext\b/i);
+		}
 	});
 
 	it("advances the iteration number with currentStep", () => {
@@ -137,18 +145,12 @@ describe("buildPrompt", () => {
 });
 
 describe("buildNudgePrompt", () => {
-	it("tells the model to continue working without mentioning loop_control", () => {
-		const p = buildNudgePrompt(goalState());
-		expect(p).toContain("The loop is still active");
-		expect(p).toContain("iteration 1");
-		expect(p).toContain("Continue working on: green tests");
-		expect(p).toContain("Do not end your turn");
+	it("continues a forever loop without mentioning loop_control", () => {
+		const p = buildNudgePrompt(foreverState());
+		expect(p).toContain("The forever loop remains active");
+		expect(p).toContain("Continue working on: watch the build");
+		expect(p).toContain("Only the user can stop");
 		expect(p).not.toContain("loop_control");
-	});
-
-	it("labels count-mode nudges with the pass number", () => {
-		const p = buildNudgePrompt(countState(2, 5));
-		expect(p).toContain("pass 3/5");
 	});
 });
 
@@ -157,12 +159,24 @@ describe("getSystemPromptAddition", () => {
 		const p = getSystemPromptAddition(goalState());
 		expect(p).toContain("Mode: goal | Step: 1/∞");
 		expect(p).toContain("Goal: green tests");
-		expect(p).toContain("You MUST call `loop_control`");
+		expect(p).toContain("The loop advances automatically when you end your turn");
+		expect(p).toContain("Call `loop_control` only when the goal is fully met");
 	});
 
 	it("shows the count for passes mode", () => {
 		const p = getSystemPromptAddition(countState(2, 7));
 		expect(p).toContain("Mode: passes | Step: 3/7");
+	});
+
+	it("tells the model to end the loop only with a reason", () => {
+		const p = getSystemPromptAddition(goalState());
+		expect(p).toContain("records your reason");
+	});
+
+	it("never mentions an advance action", () => {
+		const p = getSystemPromptAddition(goalState()) + getSystemPromptAddition(countState(0, 3));
+		expect(p).not.toMatch(/status\s+"?(next|done)/i);
+		expect(p).not.toMatch(/advance or/i);
 	});
 });
 

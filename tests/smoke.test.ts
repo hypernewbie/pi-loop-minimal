@@ -4,9 +4,9 @@ import extension from "../src/index.ts";
 import type { LoopState } from "../src/state.ts";
 
 // End-to-end lifecycle simulations through the extension's public surface:
-// command -> tool calls -> completion, exactly like a live session.
+// command -> turn ends -> completion, exactly like a live session.
 
-type ToolParams = { status: "next" | "done"; summary: string };
+type ToolParams = { reason?: string };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: LoopState };
 type CommandCtx = ExtensionContext & { waitForIdle(): Promise<void> };
 type CommandDef = { handler: (args: string, ctx: CommandCtx) => Promise<void> };
@@ -23,7 +23,7 @@ function harness() {
 		) => Promise<ToolResult>;
 	}[] = [];
 	const sentUser: string[] = [];
-	const sent: { msg: { content?: string }; opts: unknown }[] = [];
+	const sent: { msg: { content?: string; customType?: string; display?: boolean }; opts: unknown }[] = [];
 	const activeTools = ["read", "bash", "loop_control"];
 	const ui = { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() };
 	const ctx = {
@@ -33,8 +33,11 @@ function harness() {
 		sessionManager: { getBranch: () => [] },
 	} as unknown as CommandCtx;
 
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+
 	extension({
-		on: () => {},
+		on: (ev: string, fn: (event: unknown, ctx: unknown) => unknown) =>
+			handlers.set(ev, fn),
 		registerTool: (d: unknown) => toolDefs.push(d as never),
 		registerCommand: (n: string, d: unknown) => commands.set(n, d as CommandDef),
 		registerShortcut: () => {},
@@ -49,84 +52,111 @@ function harness() {
 
 	const tool = (p: ToolParams) =>
 		toolDefs[0].execute("c", p, undefined, undefined, ctx);
-	return { commands, tool, sent, sentUser, ui, ctx };
+	// A normal turn end: the model finished and stopped.
+	const turnEnd = (stopReason = "stop") =>
+		handlers.get("agent_end")!(
+			{ messages: [{ role: "assistant", stopReason }] },
+			ctx,
+		);
+
+	return { commands, tool, sent, sentUser, ui, ctx, turnEnd, activeTools };
 }
 
 describe("goal loop lifecycle", () => {
-	it("start -> two nexts -> done completes after 3 iterations", async () => {
+	it("a turn end advances to the next iteration", async () => {
 		const h = harness();
 		await h.commands.get("loop")!.handler("goal ship the feature", h.ctx);
 		expect(h.sentUser[0]).toContain("## Loop — Iteration 1");
 
-		await h.tool({ status: "next", summary: "started" });
+		await h.turnEnd();
 		expect(h.sent[0].msg.content).toContain("## Loop — Iteration 2");
 
-		await h.tool({ status: "next", summary: "more" });
+		await h.turnEnd();
 		expect(h.sent[1].msg.content).toContain("## Loop — Iteration 3");
-
-		const r = await h.tool({ status: "done", summary: "all done" });
-		expect(r.content[0].text).toContain(
-			"Loop complete after 3 iteration(s)",
-		);
-		// no further steer after done
-		expect(h.sent).toHaveLength(2);
 	});
 
 	it("every goal iteration steers with the open-ended prompt", async () => {
 		const h = harness();
 		await h.commands.get("loop")!.handler("goal keep going", h.ctx);
-		await h.tool({ status: "next", summary: "1" });
-		await h.tool({ status: "next", summary: "2" });
+		await h.turnEnd();
+		await h.turnEnd();
 		expect(h.sent[0].msg.content).toContain(
-			'call loop_control with status "done" and explain why',
+			"call loop_control and give the reason why",
 		);
 		expect(h.sent[1].msg.content).toContain(
-			'call loop_control with status "done" and explain why',
+			"call loop_control and give the reason why",
 		);
+	});
+
+	it("the model ends the loop with a justification", async () => {
+		const h = harness();
+		await h.commands.get("loop")!.handler("goal ship the feature", h.ctx);
+		await h.turnEnd();
+		await h.turnEnd();
+
+		const r = await h.tool({ reason: "all green" });
+		expect(r.content[0].text).toContain("Loop complete after 3 iteration(s)");
+		expect(r.content[0].text).toContain("all green");
+		// the loop is over: no further iteration is steered
+		await h.turnEnd();
+		expect(h.sent).toHaveLength(2);
+	});
+
+	it("a call without a justification does not end the loop", async () => {
+		const h = harness();
+		await h.commands.get("loop")!.handler("goal x", h.ctx);
+		const r = await h.tool({});
+		expect(r.content[0].text).toContain("needs a reason");
+		await h.turnEnd();
+		expect(h.sent).toHaveLength(1);
 	});
 });
 
 describe("count loop lifecycle", () => {
-	it("/loop 3 runs exactly three passes, then completes on the third next", async () => {
+	it("/loop 3 runs exactly three passes, then completes", async () => {
 		const h = harness();
 		await h.commands.get("loop")!.handler("3 polish", h.ctx);
 		expect(h.sentUser[0]).toContain("## Loop — Pass 1 of 3");
 
-		await h.tool({ status: "next", summary: "p1" });
+		await h.turnEnd();
 		expect(h.sent[0].msg.content).toContain("## Loop — Pass 2 of 3");
 
-		await h.tool({ status: "next", summary: "p2" });
+		await h.turnEnd();
 		expect(h.sent[1].msg.content).toContain("## Loop — Pass 3 of 3");
 
-		const r = await h.tool({ status: "next", summary: "p3" });
-		expect(r.content[0].text).toContain("all 3 iterations done");
+		await h.turnEnd();
+		const done = h.sent.find((m) => m.msg.customType === "loop-complete");
+		expect(done?.msg.content).toContain("all 3 passes done");
 		// no fourth pass is ever steered
-		expect(h.sent).toHaveLength(2);
+		expect(h.sent.filter((m) => m.msg.customType === "loop-iteration")).toHaveLength(2);
 		expect(h.sentUser).toHaveLength(1);
 	});
 
-	it("/loop 1 completes on the first next", async () => {
+	it("/loop 1 completes on the first turn end", async () => {
 		const h = harness();
 		await h.commands.get("loop")!.handler("1 once", h.ctx);
-		const r = await h.tool({ status: "next", summary: "done" });
-		expect(r.content[0].text).toContain("all 1 iterations done");
-		expect(h.sent).toHaveLength(0);
+		await h.turnEnd();
+		expect(h.sent.find((m) => m.msg.customType === "loop-complete")?.msg.content).toContain(
+			"all 1 passes done",
+		);
+		expect(h.sent.filter((m) => m.msg.customType === "loop-iteration")).toHaveLength(0);
 	});
 
-	it("done before the final pass still completes the loop", async () => {
+	it("the model can end a count loop early", async () => {
 		const h = harness();
 		await h.commands.get("loop")!.handler("4 task", h.ctx);
-		const r = await h.tool({ status: "done", summary: "finished early" });
+		const r = await h.tool({ reason: "finished early" });
 		expect(r.content[0].text).toContain("Loop complete after 1 iteration(s)");
+		await h.turnEnd();
 		expect(h.sent).toHaveLength(0);
 	});
 });
 
 describe("cross-surface consistency", () => {
-	it("keeps widget, steer prompt, and tool result in lockstep", async () => {
+	it("keeps widget, steer prompt, and iteration number in lockstep", async () => {
 		const h = harness();
 		await h.commands.get("loop")!.handler("2 render", h.ctx);
-		await h.tool({ status: "next", summary: "s" });
+		await h.turnEnd();
 
 		// widget now shows pass 2/2 (the pass now running)
 		const lastWidget = h.ui.setWidget.mock.calls.at(-1)!;
@@ -137,9 +167,8 @@ describe("cross-surface consistency", () => {
 	it("goal-mode states survive a JSON round trip (no Infinity sentinel)", async () => {
 		const h = harness();
 		await h.commands.get("loop")!.handler("goal stable", h.ctx);
-		const r = await h.tool({ status: "next", summary: "s" });
-		// details already carry maxSteps: null (JSON-safe) rather than
-		// Infinity, and the round trip is lossless
+		await h.turnEnd();
+		const r = await h.tool({ reason: "done" });
 		expect(r.details?.maxSteps).toBeNull();
 		expect(JSON.parse(JSON.stringify(r.details))).toEqual(r.details);
 	});

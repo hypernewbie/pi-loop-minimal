@@ -51,8 +51,8 @@ export function buildPrompt(state: LoopState): string {
 				? `This is the first pass. Do an initial implementation/analysis.`
 				: step < max - 1
 					? `This is a refinement pass. Review and improve on the previous pass.`
-					: `This is the **final pass**. Do a final polish, then call loop_control with status "done".`,
-			`\nWhen this pass is complete, call loop_control with status "next" (or "done" on the final pass).`,
+					: `This is the **final pass**. Do a final polish, then end your turn — the loop completes on its own.`,
+			`\nEach pass ends when you end your turn. Call loop_control only to end the loop early, with your reason.`,
 		].join("\n");
 	}
 
@@ -69,8 +69,9 @@ export function buildPrompt(state: LoopState): string {
 	return [
 		`## Loop — Iteration ${step + 1}`,
 		`Goal: ${state.goal}`,
-		`Work toward the goal. When the goal is fully met, call loop_control with status "done" and explain why.`,
-		`If more work is needed, call loop_control with status "next" describing what's left.`,
+		`Work toward the goal.`,
+		`Each iteration ends when you end your turn — the loop continues automatically.`,
+		`When the goal is fully met, call loop_control and give the reason why.`,
 	].join("\n");
 }
 
@@ -133,27 +134,14 @@ export function parsePassesArgs(parts: string[]): LoopState | string {
 	};
 }
 
-// Steer message sent when the model ends its turn with the loop still
-// open. It tells the model to keep working — not to call loop_control —
-// because a turn that ends without closing the loop is usually a bug-end,
-// not a deliberate completion.
+// Continuation message for a forever loop: the model ended its turn, the
+// work session stays open. Forever loops have no iteration counter — the
+// same turn-end drives both the goal/count advance and this continuation.
 export function buildNudgePrompt(state: LoopState): string {
-	if (state.forever) {
-		return [
-			"The forever loop remains active.",
-			`Continue working on: ${state.goal}`,
-			"Only the user can stop this work session.",
-		].join("\n");
-	}
-
-	const label =
-		state.mode === "passes"
-			? `pass ${state.currentStep + 1}/${state.maxSteps}`
-			: `iteration ${state.currentStep + 1}`;
 	return [
-		`The loop is still active — you ended your turn before finishing ${label}.`,
+		"The forever loop remains active.",
 		`Continue working on: ${state.goal}`,
-		"Do not end your turn until this iteration is complete.",
+		"Only the user can stop this work session.",
 	].join("\n");
 }
 
@@ -206,7 +194,7 @@ export function getSystemPromptAddition(state: LoopState): string {
 		"## Active Loop",
 		`Mode: ${state.mode} | Step: ${state.currentStep + 1}/${state.maxSteps === null ? "∞" : state.maxSteps}`,
 		`Goal: ${state.goal}`,
-		"You MUST call `loop_control` when you finish your work for this iteration.",
-		'Use status "next" to advance or "done" when the goal is fully met.',
+		"The loop advances automatically when you end your turn.",
+		"Call `loop_control` only when the goal is fully met — it ends the loop and records your reason.",
 	].join("\n");
 }

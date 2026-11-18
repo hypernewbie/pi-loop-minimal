@@ -1,4 +1,10 @@
-// loop-tool.ts — Tool definition, execution, and rendering for loop_control
+// tool.ts — Tool definition, execution, and rendering for loop_control
+//
+// loop_control has exactly one job: end the loop, with a justification.
+// It used to carry a "next" action that let the model advance the loop
+// itself, which meant a badly behaving model could manufacture progress by
+// calling next over and over. The extension now owns iteration boundaries:
+// a turn that ends advances the loop, and the model can only close it.
 //
 // Ported from pi-agent-loop@0.1.1 (MIT). Changes from the original:
 // the pipeline branch is removed, and the `setTimeout(..., 100)` before the
@@ -7,19 +13,18 @@
 // so sending synchronously is safe and removes the ordering race.
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { buildPrompt, type LoopState } from "./state.js";
+import type { LoopState } from "./state.js";
+
+export interface LoopControlParams {
+	reason?: string;
+}
 
 export function handleLoopControlTool(
-	params: { status: "next" | "done"; summary: string; reason?: string },
+	params: LoopControlParams,
 	state: LoopState,
-	pi: ExtensionAPI,
-	_ctx: ExtensionContext,
 ): {
 	content: { type: "text"; text: string }[];
 	details: LoopState | undefined;
@@ -50,68 +55,34 @@ export function handleLoopControlTool(
 		};
 	}
 
-	if (params.status === "done") {
-		const newState = {
-			...state,
-			done: true,
-			reasonDone: params.reason ?? params.summary,
-			active: false,
-		};
+	// A missing or blank reason means the call was not a valid end-of-loop
+	// signal (a legacy "next" call, for example). It must not change state.
+	const reason =
+		typeof params.reason === "string" ? params.reason.trim() : "";
+	if (!reason) {
 		return {
 			content: [
 				{
 					type: "text",
-					text: `✓ Loop complete after ${state.currentStep + 1} iteration(s). Reason: ${newState.reasonDone}`,
+					text: "loop_control needs a reason: state why the goal is met. The loop is still active.",
 				},
 			],
-			details: { ...newState } as LoopState,
-			newState,
+			details: undefined,
+			newState: state,
 		};
 	}
 
-	// status === "next" — advance
-	const newState = { ...state, currentStep: state.currentStep + 1 };
-
-	// `!forever` is belt and braces: parseForeverArgs only mints goal mode, so
-	// this can only matter for hand-edited session details.
-	const atEnd =
-		!state.forever &&
-		state.mode === "passes" &&
-		newState.currentStep >= (state.maxSteps ?? 0);
-
-	if (atEnd) {
-		const finalState = {
-			...newState,
-			done: true,
-			active: false,
-			reasonDone: "Completed all passes",
-		};
-		return {
-			content: [
-				{
-					type: "text",
-					text: `✓ Loop complete — all ${state.maxSteps} iterations done.`,
-				},
-			],
-			details: { ...finalState } as LoopState,
-			newState: finalState,
-		};
-	}
-
-	pi.sendMessage(
-		{
-			customType: "loop-iteration",
-			content: buildPrompt(newState),
-			display: false,
-		},
-		{ triggerTurn: true, deliverAs: "steer" },
-	);
-
+	const newState = {
+		...state,
+		done: true,
+		reasonDone: reason,
+		active: false,
+	};
 	return {
 		content: [
 			{
 				type: "text",
-				text: `→ Advancing to step ${newState.currentStep + 1}. Summary: ${params.summary}`,
+				text: `✓ Loop complete after ${state.currentStep + 1} iteration(s). Reason: ${newState.reasonDone}`,
 			},
 		],
 		details: { ...newState } as LoopState,
@@ -124,34 +95,45 @@ export function getLoopControlToolDefinition() {
 		name: "loop_control",
 		label: "Loop Control",
 		description: [
-			"Signal loop progress. Call this when you finish a loop iteration.",
-			"status 'next': advance to the next step/pass.",
-			"status 'done': the goal is met or the final pass is complete.",
-			"Only available when a loop is active.",
+			"End the active loop. Call this only when the goal is fully met.",
+			"The loop continues by itself after each turn — this tool only closes it.",
+			"reason: why the goal is met.",
 		].join(" "),
 		parameters: Type.Object({
-			status: StringEnum(["next", "done"] as const),
-			summary: Type.String({
-				description: "Brief summary of what was accomplished this iteration",
+			reason: Type.String({
+				description: "Why the goal is met (recorded as the completion reason)",
 			}),
-			reason: Type.Optional(
-				Type.String({ description: "Why the goal is met (for 'done')" }),
-			),
 		}),
+		prepareArguments(args: unknown): { reason: string } {
+			// Older sessions stored { status: "done", summary, reason } calls.
+			// Fold them into the current shape; a legacy "next" call has no
+			// equivalent any more, so it is left alone and fails validation
+			// rather than silently ending the loop.
+			const a = (args ?? {}) as {
+				status?: string;
+				reason?: string;
+				summary?: string;
+			};
+			if (a.status === "done") {
+				return { reason: a.reason ?? a.summary ?? "Goal met" };
+			}
+			// A legacy "next" call has no equivalent any more. It folds to an
+			// empty reason, which the tool rejects — a stale call must not end
+			// the loop.
+			return { reason: a.reason ?? "" };
+		},
 	};
 }
 
-export function renderLoopControlCall(
-	args: { status: string },
-	theme: unknown,
-) {
+export function renderLoopControlCall(args: { reason?: string }, theme: unknown) {
 	const t = theme as {
 		fg: (k: string, s: string) => string;
 		bold: (s: string) => string;
 	};
+	const reason = (args.reason ?? "").trim();
 	return new Text(
 		t.fg("toolTitle", t.bold("loop_control ")) +
-			t.fg(args.status === "done" ? "success" : "accent", args.status),
+			t.fg("success", reason ? "end" : "end (no reason)"),
 		0,
 		0,
 	);
@@ -165,9 +147,8 @@ export function renderLoopControlResult(
 	const d = result.details as LoopState | undefined;
 	if (!d) return new Text("", 0, 0);
 	const t = theme as { fg: (color: string, text: string) => string };
-	// currentStep is the number of iterations already completed (0-based
-	// index of the iteration that just finished), so "next" shows the pass
-	// that just completed while the widget shows the one now running.
+	// currentStep is the number of iterations already completed, so the widget
+	// shows the one now running while a result shows what just finished.
 	const label = d.done
 		? "✓ loop complete"
 		: d.mode === "passes"

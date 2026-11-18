@@ -4,7 +4,9 @@
 //   /loop <N> <task>          — repeat exactly N times
 //   /loop forever <task>      — continue until the user stops it
 //
-// Goal/count loops give the LLM `loop_control`; forever intentionally does not.
+// The extension owns iteration boundaries: a turn that ends advances the
+// loop. `loop_control` can only end a loop, with a reason. Forever loops do
+// not expose the tool at all.
 // Ctrl+Shift+X to abort at any time.
 //
 // Ported from pi-agent-loop@0.1.1 (MIT). Changes from the original:
@@ -38,14 +40,15 @@ import {
 
 export default function (pi: ExtensionAPI) {
 	let state = emptyState();
-	// Runtime-only: true while a live loop expects the next agent-end check.
-	// Goal/count loops clear it when loop_control runs, while tool-free forever
-	// loops keep it armed for every ordinary agent_end continuation.
-	let awaitingContinuation = false;
 
 	const LOOP_CONTROL_TOOL = "loop_control";
-	const START_ENTRY = "loop-started";
+	const STATE_ENTRY = "loop-state";
+	const LEGACY_START_ENTRY = "loop-started";
 	const STOP_ENTRY = "loop-stopped";
+
+	// Loop state lives in session entries, not in tool results: the model can
+	// no longer advance a loop, so there is no tool result to reconstruct from.
+	const persist = (s: LoopState) => pi.appendEntry(STATE_ENTRY, { ...s });
 
 	// Derive each change from Pi's current list: never restore a stale snapshot
 	// and accidentally overwrite tool choices made by the user or extensions.
@@ -64,7 +67,6 @@ export default function (pi: ExtensionAPI) {
 		state.active = false;
 		state.done = true;
 		state.reasonDone = reason;
-		awaitingContinuation = false;
 		pi.appendEntry(STOP_ENTRY, { reason });
 		updateWidget(state, ctx);
 	};
@@ -73,9 +75,13 @@ export default function (pi: ExtensionAPI) {
 	const reconstruct = (ctx: ExtensionContext) => {
 		state = emptyState();
 		for (const entry of ctx.sessionManager.getBranch()) {
-			// Entries are replayed in order: a later start wins over a stop, and a
-			// later stop wins over the start/tool result that preceded it.
-			if (entry.type === "custom" && entry.customType === START_ENTRY) {
+			// Entries are replayed in order: a later state wins over an earlier
+			// one, and a later stop wins over the state that preceded it.
+			if (
+				entry.type === "custom" &&
+				(entry.customType === STATE_ENTRY ||
+					entry.customType === LEGACY_START_ENTRY)
+			) {
 				const d = entry.data as Partial<LoopState> | undefined;
 				if (d) state = { ...emptyState(), ...d };
 				continue;
@@ -100,7 +106,6 @@ export default function (pi: ExtensionAPI) {
 				if (d) state = { ...emptyState(), ...d };
 			}
 		}
-		awaitingContinuation = state.active;
 		if (state.active && state.forever) setLoopControlActive(false);
 		updateWidget(state, ctx);
 	};
@@ -123,10 +128,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// ── Force-close: nudge a run that ended with the loop still open ────
-	pi.on("agent_end", async (event, _ctx) => {
-		if (!state.active || !awaitingContinuation) return;
-		// Never restart a run the user aborted or one that errored: Pi ends
+	// ── Turn end: the extension advances the loop ───────────────────────
+	pi.on("agent_end", async (event, ctx) => {
+		if (!state.active) return;
+		// Never advance on a run the user aborted or one that errored: Pi ends
 		// those with a final message carrying stopReason "aborted"/"error".
 		const last = event.messages.at(-1);
 		// Pi's stream contract ends aborted/errored runs with a final
@@ -137,26 +142,63 @@ export default function (pi: ExtensionAPI) {
 				? (last as { stopReason?: string }).stopReason
 				: undefined;
 		if (stopReason === "aborted" || stopReason === "error") return;
-		if (state.forever) setLoopControlActive(false);
+
+		if (state.forever) {
+			setLoopControlActive(false);
+			pi.sendMessage(
+				{
+					customType: "loop-nudge",
+					content: buildNudgePrompt(state),
+					display: false,
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
+			return;
+		}
+
+		// The turn ended, so that iteration is over. The extension owns the
+		// boundary — the model cannot advance the loop itself.
+		const completed = state.currentStep + 1;
+		if (state.mode === "passes" && completed >= (state.maxSteps ?? 0)) {
+			state = {
+				...state,
+				currentStep: completed,
+				done: true,
+				active: false,
+				reasonDone: "Completed all passes",
+			};
+			persist(state);
+			updateWidget(state, ctx);
+			pi.sendMessage({
+				customType: "loop-complete",
+				content: `✓ Loop complete — all ${state.maxSteps} passes done.`,
+				display: true,
+			});
+			return;
+		}
+
+		state = { ...state, currentStep: completed };
+		persist(state);
+		updateWidget(state, ctx);
 		pi.sendMessage(
 			{
-				customType: "loop-nudge",
-				content: buildNudgePrompt(state),
+				customType: "loop-iteration",
+				content: buildPrompt(state),
 				display: false,
 			},
 			{ triggerTurn: true, deliverAs: "steer" },
 		);
 	});
 
-	// ── Tool: the LLM calls this to signal progress ─────────────────────
+	// ── Tool: the LLM calls this to end the loop, with a reason ─────────
 	pi.registerTool({
 		...getLoopControlToolDefinition(),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const result = handleLoopControlTool(params, state, pi, ctx);
+			const result = handleLoopControlTool(params, state);
 			state = result.newState;
-			// Re-arm for the next iteration; an inactive loop has nothing to
-			// await, so a later agent_end stays silent.
-			awaitingContinuation = result.newState.active;
+			// Only a real state change is persisted, so a rejected call cannot
+			// resurrect a stopped loop on the next reconstruction.
+			if (result.details) persist(state);
 			updateWidget(state, ctx);
 			return {
 				content: result.content,
@@ -235,11 +277,10 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			state = result;
-			awaitingContinuation = true;
 			// Forever loops are driven solely by agent_end, so their model request
 			// must not receive loop_control. Normal loop forms opt it back in.
 			setLoopControlActive(!state.forever);
-			pi.appendEntry(START_ENTRY, { ...state });
+			persist(state);
 			updateWidget(state, ctx);
 			// Kick off the first work session/iteration.
 			pi.sendUserMessage(buildPrompt(state));
