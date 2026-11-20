@@ -20,6 +20,7 @@ describe("handleLoopDoneTool — no active loop", () => {
 		const state: LoopState = {
 			active: false,
 			currentStep: 0,
+			maxSteps: null,
 			goal: "",
 			done: false,
 			reasonDone: "",
@@ -83,7 +84,7 @@ describe("handleLoopDoneTool — claiming completion", () => {
 
 describe("handleLoopNextTool — advancing an iteration", () => {
 	it("advances to the next iteration", () => {
-		const r = handleLoopNextTool({ summary: "did a pass" }, goalState(2));
+		const r = handleLoopNextTool({ summary: "did a pass" }, countState(2, 5));
 		expect(r.newState.currentStep).toBe(3);
 		expect(r.newState.active).toBe(true);
 		expect(r.content[0].text).toContain("Continuing to iteration 4");
@@ -92,9 +93,17 @@ describe("handleLoopNextTool — advancing an iteration", () => {
 	});
 
 	it("works without a summary", () => {
-		const r = handleLoopNextTool({}, goalState(0));
+		const r = handleLoopNextTool({}, countState(0, 5));
 		expect(r.newState.currentStep).toBe(1);
 		expect(r.content[0].text).toContain("Continuing to iteration 2");
+	});
+
+	it("refuses to advance a goal loop", () => {
+		const before = goalState(2);
+		const r = handleLoopNextTool({ summary: "skipping ahead" }, before);
+		expect(r.newState).toBe(before);
+		expect(r.details).toBeUndefined();
+		expect(r.content[0].text).toContain("only available in a count loop");
 	});
 
 	it("closes a count loop when the cap is reached", () => {
@@ -128,7 +137,7 @@ describe("handleLoopNextTool — advancing an iteration", () => {
 	});
 
 	it("is a no-op while a claim is being checked", () => {
-		const before = claimingState(1);
+		const before = { ...claimingState(1), maxSteps: 3 };
 		const r = handleLoopNextTool({ summary: "s" }, before);
 		expect(r.newState).toBe(before);
 		expect(r.content[0].text).toContain("claim is being checked");
@@ -207,6 +216,7 @@ describe("handleLoopApproveTool — confirming a claim", () => {
 		const before: LoopState = {
 			active: false,
 			currentStep: 0,
+			maxSteps: null,
 			goal: "",
 			done: false,
 			reasonDone: "",

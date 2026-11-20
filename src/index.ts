@@ -64,9 +64,9 @@ export default function (pi: ExtensionAPI) {
 	// no longer advance a loop, so there is no tool result to reconstruct from.
 	const persist = (s: LoopState) => pi.appendEntry(STATE_ENTRY, { ...s });
 
-	// The loop tools that belong to the current phase. Exactly the working
-	// tools are exposed while the model works, only the approval tool while a
-	// claim is checked, and none at all when there is no loop to drive.
+	// The loop tools that belong to the current phase and mode. The advance
+	// tool belongs to count loops only: in a goal loop the extension owns
+	// iteration boundaries and the model has a single verb (the claim).
 	const applyLoopTools = () => {
 		const tools = pi.getActiveTools();
 		const withoutLoopTools = tools.filter(
@@ -75,13 +75,16 @@ export default function (pi: ExtensionAPI) {
 				name !== LOOP_APPROVE_TOOL &&
 				name !== LOOP_NEXT_TOOL,
 		);
+		const countLoop = state.maxSteps !== null;
 		const wanted = !state.active
 			? []
 			: state.forever
 				? []
 				: state.evaluating
 					? [LOOP_APPROVE_TOOL]
-					: [LOOP_NEXT_TOOL, LOOP_DONE_TOOL];
+					: countLoop
+						? [LOOP_NEXT_TOOL, LOOP_DONE_TOOL]
+						: [LOOP_DONE_TOOL];
 		const next = [...withoutLoopTools, ...wanted];
 		if (next.length === tools.length && next.every((n, i) => n === tools[i])) {
 			return;
@@ -174,9 +177,16 @@ export default function (pi: ExtensionAPI) {
 	// Tool removal applies to future model requests. Block a call that was
 	// already issued by a stale/queued request before the removal took effect.
 	pi.on("tool_call", (event) => {
-		// Only the tools of the current phase may run. The active-tool list
-		// already hides the others; this covers a call that was issued
-		// before the swap took effect.
+		// Only the tools of the current phase and mode may run. The
+		// active-tool list already hides the others; this covers a call that
+		// was issued before the swap took effect.
+		if (event.toolName === LOOP_NEXT_TOOL && state.maxSteps === null) {
+			return {
+				block: true,
+				reason:
+					"loop_next is only available in a count loop — the extension advances a goal loop itself.",
+			};
+		}
 		if (event.toolName === LOOP_DONE_TOOL || event.toolName === LOOP_NEXT_TOOL) {
 			if (state.forever) {
 				return {

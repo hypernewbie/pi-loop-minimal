@@ -1,149 +1,24 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import extension from "../src/index.ts";
 import type { LoopState } from "../src/state.ts";
 import { foreverState } from "./helpers.ts";
-
-type ToolParams = { reason?: string; verdict?: string; summary?: string };
-type ToolResult = { content: { type: "text"; text: string }[]; details?: LoopState };
-type CommandCtx = ExtensionContext & { waitForIdle(): Promise<void> };
-type CommandDef = {
-	handler: (args: string, ctx: CommandCtx) => Promise<void>;
-	getArgumentCompletions?: (prefix: string) => unknown[] | null;
-};
-type ShortcutDef = { handler: (ctx: ExtensionContext) => Promise<void> };
-type ToolDef = {
-	name: string;
-	execute: (
-		id: string,
-		params: ToolParams,
-		signal: unknown,
-		onUpdate: unknown,
-		ctx: CommandCtx,
-	) => Promise<ToolResult>;
-};
-
-type BranchEntry = {
-	type: string;
-	customType?: string;
-	data?: unknown;
-	message?: { role: string; toolName?: string; details?: unknown };
-};
-
-function createHarness() {
-	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-	const toolDefs: ToolDef[] = [];
-	const commands = new Map<string, CommandDef>();
-	const shortcuts = new Map<string, ShortcutDef>();
-	const sentMessages: { msg: { customType?: string; content?: string; display?: boolean }; opts: unknown }[] = [];
-	const sentUserMessages: string[] = [];
-	const branch: BranchEntry[] = [];
-	const effects: string[] = [];
-	let activeTools = ["read", "bash", "loop_done", "unrelated_tool"];
-
-	const ui = {
-		notify: vi.fn(),
-		setStatus: vi.fn(),
-		setWidget: vi.fn(),
-	};
-
-	const setTools = (names: string[]) => {
-		activeTools = [...names];
-	};
-
-	const pi = {
-		on: (ev: string, fn: (event: unknown, ctx: unknown) => unknown) =>
-			handlers.set(ev, fn),
-		registerTool: (def: unknown) => toolDefs.push(def as ToolDef),
-		registerCommand: (name: string, def: unknown) =>
-			commands.set(name, def as CommandDef),
-		registerShortcut: (key: string, def: unknown) =>
-			shortcuts.set(key, def as ShortcutDef),
-		sendMessage: (msg: unknown, opts: unknown) =>
-			sentMessages.push({ msg: msg as never, opts }),
-		sendUserMessage: (content: string) => {
-			effects.push("send-user");
-			sentUserMessages.push(content);
-		},
-		appendEntry: (customType: string, data?: unknown) => {
-			effects.push(`entry:${customType}`);
-			branch.push({ type: "custom", customType, data } as never);
-		},
-		getActiveTools: () => [...activeTools],
-		setActiveTools: vi.fn(setTools),
-	} as unknown as ExtensionAPI;
-
-	const ctx = {
-		ui,
-		waitForIdle: vi.fn(async () => {}),
-		abort: vi.fn(() => effects.push("abort")),
-		sessionManager: { getBranch: () => branch },
-	} as unknown as CommandCtx;
-
-	extension(pi);
-
-	return {
-		handlers,
-		toolDefs,
-		commands,
-		shortcuts,
-		sentMessages,
-		sentUserMessages,
-		effects,
-		ctx,
-		ui,
-		branch,
-		activeTools: () => [...activeTools],
-		setActiveTools: pi.setActiveTools as unknown as ReturnType<typeof vi.fn>,
-		setTools,
-	};
-}
-
-type Harness = ReturnType<typeof createHarness>;
-
-const loopCmd = (h: Harness) => h.commands.get("loop")!;
-const stopCmd = (h: Harness) => h.commands.get("loop-stop")!;
-const shortcut = (h: Harness) => h.shortcuts.get("ctrl+shift+x")!;
-
-async function execTool(h: Harness, params: ToolParams): Promise<ToolResult> {
-	return doneTool(h).execute("call-1", params, undefined, undefined, h.ctx);
-}
-
-async function execApprove(h: Harness, params: ToolParams): Promise<ToolResult> {
-	return approveTool(h).execute("call-2", params, undefined, undefined, h.ctx);
-}
-
-async function execNext(h: Harness, params: ToolParams): Promise<ToolResult> {
-	return nextTool(h).execute("call-3", params, undefined, undefined, h.ctx);
-}
-
-/** A normal turn end: the model finished and stopped. */
-async function turnEnd(
-	h: Harness,
-	stopReason = "stop",
-): Promise<void> {
-	await h.handlers.get("agent_end")!(
-		{ messages: [{ role: "assistant", stopReason }] },
-		h.ctx,
-	);
-}
-
-const doneTool = (h: Harness) => h.toolDefs.find((t) => t.name === "loop_done")!;
-const nextTool = (h: Harness) => h.toolDefs.find((t) => t.name === "loop_next")!;
-const approveTool = (h: Harness) =>
-	h.toolDefs.find((t) => t.name === "loop_approve")!;
-
-const evaluations = (h: Harness) =>
-	h.sentMessages.filter((m) => m.msg.customType === "loop-evaluate");
-const resumes = (h: Harness) =>
-	h.sentMessages.filter((m) => m.msg.customType === "loop-resume");
-
-const iterations = (h: Harness) =>
-	h.sentMessages.filter((m) => m.msg.customType === "loop-iteration");
-const nudges = (h: Harness) =>
-	h.sentMessages.filter((m) => m.msg.customType === "loop-nudge");
-const completions = (h: Harness) =>
-	h.sentMessages.filter((m) => m.msg.customType === "loop-complete");
+import {
+	approveTool,
+	completions,
+	createHarness,
+	evaluations,
+	execApprove,
+	execNext,
+	execTool,
+	iterations,
+	loopCmd,
+	nudges,
+	resumes,
+	shortcut,
+	stopCmd,
+	turnEnd,
+	type Harness,
+} from "./harness.ts";
 
 describe("extension surface", () => {
 	it("registers the loop and loop-stop commands, both tools, and the shortcut", () => {
@@ -298,7 +173,7 @@ describe("loop_done claims completion", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("goal win", h.ctx);
 		expect(h.activeTools()).toContain("loop_done");
-		expect(h.activeTools()).toContain("loop_next");
+		expect(h.activeTools()).not.toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 		await execTool(h, { reason: "all tests pass" });
 		expect(h.activeTools()).not.toContain("loop_done");
@@ -330,9 +205,9 @@ describe("loop_done claims completion", () => {
 		expect(resumes(h)).toHaveLength(1);
 		expect(resumes(h)[0].msg.content).toContain("the build fails");
 		expect(resumes(h)[0].msg.content).toContain("Keep working on the goal");
-		// the work tools come back, the approval tool goes away
+		// the work tool comes back, the approval tool goes away
 		expect(h.activeTools()).toContain("loop_done");
-		expect(h.activeTools()).toContain("loop_next");
+		expect(h.activeTools()).not.toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 	});
 
@@ -355,7 +230,7 @@ describe("loop_done claims completion", () => {
 		expect(resumes(h)).toHaveLength(1);
 		expect(resumes(h)[0].msg.content).toContain("the claim was not confirmed");
 		expect(h.activeTools()).toContain("loop_done");
-		expect(h.activeTools()).toContain("loop_next");
+		expect(h.activeTools()).not.toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 	});
 
@@ -740,7 +615,6 @@ describe("/loop forever", () => {
 			"read",
 			"unrelated_tool",
 			"user_added_tool",
-			"loop_next",
 			"loop_done",
 		]);
 		await loopCmd(h).handler("3 x", h.ctx);
@@ -844,29 +718,29 @@ describe("before_agent_start", () => {
 	});
 });
 
-describe("loop_next advances the iteration", () => {
+describe("loop_next advances the iteration (count loops only)", () => {
 	it("advances and dispatches the next iteration", async () => {
 		const h = createHarness();
-		await loopCmd(h).handler("goal keep going", h.ctx);
+		await loopCmd(h).handler("3 keep going", h.ctx);
 		const r = await execNext(h, { summary: "half done" });
 		expect(r.details).toMatchObject({ currentStep: 1, active: true });
 		expect(r.content[0].text).toContain("Continuing to iteration 2");
 		expect(iterations(h)).toHaveLength(1);
-		expect(iterations(h)[0].msg.content).toContain("## Loop — Iteration 2");
+		expect(iterations(h)[0].msg.content).toContain("## Loop — Pass 2 of 3");
 		expect(h.ui.setWidget).toHaveBeenLastCalledWith("loop", [
-			"iter 2 · keep going",
+			"pass 2/3 · keep going",
 			"Ctrl+Shift+X to stop",
 		]);
 	});
 
 	it("does not count the same iteration again when the turn ends", async () => {
 		const h = createHarness();
-		await loopCmd(h).handler("goal keep going", h.ctx);
+		await loopCmd(h).handler("3 keep going", h.ctx);
 		await execNext(h, { summary: "half done" });
 		await turnEnd(h);
 		// one advance only: the model already closed that iteration
 		expect(iterations(h)).toHaveLength(1);
-		expect(h.ui.setStatus).toHaveBeenLastCalledWith("loop", "loop · iter 2");
+		expect(h.ui.setStatus).toHaveBeenLastCalledWith("loop", "loop · pass 2/3");
 		// the loop keeps working instead of stalling
 		expect(nudges(h)).toHaveLength(1);
 		expect(nudges(h)[0].msg.content).toContain("The loop is still active");
@@ -874,17 +748,17 @@ describe("loop_next advances the iteration", () => {
 
 	it("advances again on the next turn end", async () => {
 		const h = createHarness();
-		await loopCmd(h).handler("goal keep going", h.ctx);
+		await loopCmd(h).handler("3 keep going", h.ctx);
 		await execNext(h, { summary: "half done" });
 		await turnEnd(h);
 		await turnEnd(h);
 		expect(iterations(h)).toHaveLength(2);
-		expect(iterations(h)[1].msg.content).toContain("## Loop — Iteration 3");
+		expect(iterations(h)[1].msg.content).toContain("## Loop — Pass 3 of 3");
 	});
 
 	it("is blocked while a claim is being checked", async () => {
 		const h = createHarness();
-		await loopCmd(h).handler("goal x", h.ctx);
+		await loopCmd(h).handler("3 polish", h.ctx);
 		await execTool(h, { reason: "claiming" });
 		const blocked = h.handlers.get("tool_call")!(
 			{ toolName: "loop_next" },
@@ -894,6 +768,16 @@ describe("loop_next advances the iteration", () => {
 			block: true,
 			reason: "loop_next is unavailable while a completion claim is being checked.",
 		});
+	});
+
+	it("is blocked in a goal loop, where the extension owns the boundary", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal keep going", h.ctx);
+		const blocked = h.handlers.get("tool_call")!(
+			{ toolName: "loop_next" },
+			h.ctx,
+		);
+		expect(blocked).toMatchObject({ block: true });
 	});
 });
 

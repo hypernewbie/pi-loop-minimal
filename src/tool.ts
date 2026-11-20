@@ -230,6 +230,21 @@ export function handleLoopNextTool(
 		};
 	}
 
+	// The advance tool belongs to count loops. In a goal loop the extension
+	// owns iteration boundaries, and the model only claims completion.
+	if (state.maxSteps === null) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: "loop_next is only available in a count loop. The loop advances itself here.",
+				},
+			],
+			details: undefined,
+			newState: state,
+		};
+	}
+
 	// A stale advance while a claim is being checked must not replace it.
 	if (state.evaluating) {
 		return {

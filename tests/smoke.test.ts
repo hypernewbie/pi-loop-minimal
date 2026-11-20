@@ -6,7 +6,7 @@ import type { LoopState } from "../src/state.ts";
 // End-to-end lifecycle simulations through the extension's public surface:
 // command -> turn ends -> completion, exactly like a live session.
 
-type ToolParams = { reason?: string; verdict?: string };
+type ToolParams = { reason?: string; verdict?: string; summary?: string };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: LoopState };
 type CommandCtx = ExtensionContext & { waitForIdle(): Promise<void> };
 type CommandDef = { handler: (args: string, ctx: CommandCtx) => Promise<void> };
@@ -195,13 +195,14 @@ describe("cross-surface consistency", () => {
 		expect(JSON.parse(JSON.stringify(r.details))).toEqual(r.details);
 	});
 
-	it("exposes only the tools of the current phase", async () => {
+	it("exposes only the tools of the current phase and mode", async () => {
 		const h = harness();
 		expect(h.activeTools()).not.toContain("loop_done");
 		expect(h.activeTools()).not.toContain("loop_next");
+		// a goal loop: the claim tool only
 		await h.commands.get("loop")!.handler("goal x", h.ctx);
 		expect(h.activeTools()).toContain("loop_done");
-		expect(h.activeTools()).toContain("loop_next");
+		expect(h.activeTools()).not.toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 		await h.tool({ reason: "claiming" });
 		expect(h.activeTools()).not.toContain("loop_done");
@@ -210,6 +211,11 @@ describe("cross-surface consistency", () => {
 		await h.approve({ verdict: "reached", reason: "verified" });
 		expect(h.activeTools()).not.toContain("loop_done");
 		expect(h.activeTools()).not.toContain("loop_next");
+		expect(h.activeTools()).not.toContain("loop_approve");
+		// a count loop: the advance tool joins the claim tool
+		await h.commands.get("loop")!.handler("3 x", h.ctx);
+		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 	});
 });

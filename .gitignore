@@ -2,3 +2,4 @@ node_modules/
 .pi-subagents/
 temp/
 *.log
+AGENTS.md

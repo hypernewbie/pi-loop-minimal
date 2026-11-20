@@ -14,10 +14,10 @@ continuously until you stop it. A trimmed, modernized port of
   loop tool; ending a turn starts another work turn until **you** stop it.
 - **Exact-count loops** — `/loop <N> <task>`: exactly N iterations. The loop
   completes itself after the Nth one.
-- **Three tools, one phase at a time**: `loop_next` and `loop_done` while the
-  model works, `loop_approve` alone while a claim is checked, and none at all
-  when no loop runs. The extension owns iteration boundaries — a turn that ends
-  advances the loop.
+- **One phase, one mode at a time**: `loop_done` while the model works,
+  `loop_approve` alone while a claim is checked, and none at all when no loop
+  runs. `loop_next` joins the working set in count loops only — a goal loop
+  has exactly one verb, and the extension owns its iteration boundaries.
 - **Turn-driven iterations**: when the model ends a turn with the loop still
   open, the loop steers the next iteration immediately (`triggerTurn`), so a
   turn can never silently stall the loop. Runs the user aborted (`Esc`) or that
@@ -66,20 +66,25 @@ pi install git:github.com/hypernewbie/pi-loop-minimal
 
 ### Iteration boundaries
 
-An iteration ends when the model calls `loop_next` **or** when its turn ends —
-whichever comes first. The two never count the same iteration twice: a turn
-end right after a `loop_next` hands the same iteration back instead of
-counting it again.
+**A goal loop has one verb.** The model claims completion (`loop_done`); the
+extension advances the loop when the turn ends. The model never advances a
+goal loop itself — there is no advance tool in its tool set, and a stale or
+forged call is refused without touching any state.
+
+**A count loop has two.** On top of the claim it gets `loop_next`, so the
+model can close a pass without ending its turn:
 
 ```text
-loop_next(summary?)      # working phase: this iteration is done
-loop_done(reason)        # working phase: the goal is met (a claim)
-loop_approve(verdict, reason)   # check phase: the verdict
+loop_next(summary?)            # count loops only: this pass is done
+loop_done(reason)              # every loop: the goal is met (a claim)
+loop_approve(verdict, reason)  # check phase: the verdict
 ```
 
-`loop_next` is only needed to move on without ending the turn — a turn end
-advances the loop anyway. It matters for count loops, where the model may
-want to chain several passes into one turn.
+There, an iteration ends when the model calls `loop_next` **or** when its turn
+ends — whichever comes first. The two never count the same iteration twice: a
+turn end right after a `loop_next` hands the same iteration back instead of
+counting it again, so a model can chain several passes into one turn without
+inflating the count.
 
 Count semantics are strict: `/loop 3 …` runs **exactly** three iterations and
 completes itself after the third, whichever way each iteration ended. The
@@ -156,8 +161,9 @@ Exactly one loop tool is exposed at a time, and none when no loop runs:
 | State | Exposed |
 |---|---|
 | no loop | none |
-| loop, working | `loop_next`, `loop_done` |
-| loop, checking a claim | `loop_approve` |
+| goal loop, working | `loop_done` |
+| count loop, working | `loop_next`, `loop_done` |
+| any loop, checking a claim | `loop_approve` |
 | forever loop | none |
 
 The active-tool list is derived from Pi's current list each time, so tool
@@ -214,10 +220,13 @@ no tool result at all.
   ending the loop.
 - **Confirmation before closing**: a `loop_done` claim is checked in the next
   turn by `loop_approve`, and an unconfirmed claim resumes the loop instead of
-  closing it. Only the current phase's tools are exposed.
+  closing it. Only the current phase's tools are exposed, and only the
+  current mode's.
 - **The count form came back**: `/loop <N> <task>` runs exactly N iterations.
-  `loop_next` is the model-facing advance, and an iteration also ends when the
-  turn ends — the two never count the same iteration twice.
+  `loop_next` is the model-facing advance, and it is scoped to count loops —
+  a goal loop still has exactly one verb, and the extension still owns its
+  iteration boundaries. An iteration in a count loop also ends when the turn
+  ends; the two never count the same iteration twice.
 - **Durable loop state**: state moved from tool-result details to explicit
   `loop-state` entries, because the model no longer produces a result per
   iteration. Legacy sessions that carry tool-result details still restore.
@@ -234,15 +243,20 @@ intentional exception: it has its own tool-free prompt and continuation.
 
 ```bash
 npm install
-npm test          # vitest — 167 tests
+npm test          # vitest — 189 tests
 npm run typecheck # tsc --noEmit (src + tests)
 npm pack --dry-run
 ```
 
 The tests cover parsing, prompts, turn-end transitions, the claim and
-confirmation phases, tool exposure per phase, renderers, command dispatch,
-stop controls, and session reconstruction through a fake `ExtensionAPI`
-harness.
+confirmation phases, tool exposure per phase and mode, renderers, command
+dispatch, stop controls, and session reconstruction through a fake
+`ExtensionAPI` harness.
+
+`tests/contracts.test.ts` holds the invariants that must never break — most
+of all that a goal loop never exposes an advance tool. Each rule is asserted
+from several independent angles (exposure, call gate, handler, prompt,
+counter), and each test is marked as never to be removed.
 
 ## Provenance and license
 

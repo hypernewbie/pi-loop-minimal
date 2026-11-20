@@ -100,7 +100,7 @@ export function buildPrompt(state: LoopState): string {
 		`## Loop — Iteration ${step + 1}`,
 		`Goal: ${state.goal}`,
 		`Work toward the goal.`,
-		`An iteration ends when you call loop_next or when you end your turn — the loop continues automatically.`,
+		`Each iteration ends when you end your turn — the loop continues automatically.`,
 		`When the goal is fully met, call loop_done and give the reason why.`,
 	].join("\n");
 }
@@ -301,7 +301,6 @@ export function getSystemPromptAddition(state: LoopState): string {
 		`Goal: ${state.goal}`,
 		`Iteration: ${state.currentStep + 1}`,
 		"The loop advances automatically when you end your turn.",
-		"Call `loop_next` to end this iteration and start the next one.",
 		"Call `loop_done` only when the goal is fully met — a claim is confirmed in a follow-up check before the loop closes.",
 	].join("\n");
 }

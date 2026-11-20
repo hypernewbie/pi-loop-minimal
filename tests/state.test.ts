@@ -149,7 +149,7 @@ describe("buildPrompt", () => {
 		const p = buildPrompt(goalState());
 		expect(p).toContain("## Loop — Iteration 1");
 		expect(p).toContain("Goal: green tests");
-		expect(p).toContain("An iteration ends when you call loop_next or when you end your turn");
+		expect(p).toContain("Each iteration ends when you end your turn");
 		expect(p).toContain("call loop_done and give the reason why");
 	});
 
