@@ -1,7 +1,7 @@
 # pi-loop-minimal
 
-Pi extension for agent loops: run until a goal is met, or continuously until
-you stop it. A trimmed, modernized port of
+Pi extension for agent loops: run until a goal is met, exactly N times, or
+continuously until you stop it. A trimmed, modernized port of
 [`pi-agent-loop`](https://www.npmjs.com/package/pi-agent-loop) (see
 [Provenance](#provenance-and-license)).
 
@@ -10,12 +10,14 @@ you stop it. A trimmed, modernized port of
 - **Goal loops** — `/loop goal <description>`: iterate until the model *claims*
   the goal is met **and** a confirmation check agrees. Open-ended: there is no
   iteration cap, matching the original behavior.
-- **Forever loops** — `/loop forever <task>`: the model does not receive
-  `loop_done`; ending a turn starts another work turn until **you** stop it.
-- **Two tools, one at a time**: `loop_done` (working) and `loop_approve`
-  (confirmation). Exactly one is exposed, and only while a loop runs. The
-  extension owns iteration boundaries — a turn that ends advances the loop.
-  Forever loops get neither.
+- **Forever loops** — `/loop forever <task>`: the model does not receive any
+  loop tool; ending a turn starts another work turn until **you** stop it.
+- **Exact-count loops** — `/loop <N> <task>`: exactly N iterations. The loop
+  completes itself after the Nth one.
+- **Three tools, one phase at a time**: `loop_next` and `loop_done` while the
+  model works, `loop_approve` alone while a claim is checked, and none at all
+  when no loop runs. The extension owns iteration boundaries — a turn that ends
+  advances the loop.
 - **Turn-driven iterations**: when the model ends a turn with the loop still
   open, the loop steers the next iteration immediately (`triggerTurn`), so a
   turn can never silently stall the loop. Runs the user aborted (`Esc`) or that
@@ -41,7 +43,8 @@ pi install git:github.com/hypernewbie/pi-loop-minimal
 
 | Command | Description |
 |---|---|
-| `/loop goal <description>` | Iterate until the goal is met |
+| `/loop goal <description>` | Iterate until the goal is met and confirmed |
+| `/loop <N> <task>` | Run exactly N iterations (N >= 1) |
 | `/loop forever <task>` | Iterate until you stop it; the model cannot end it |
 | `/loop-stop` | Stop the active loop |
 
@@ -51,8 +54,8 @@ pi install git:github.com/hypernewbie/pi-loop-minimal
 
 1. `/loop …` waits for idle, then kicks off the first work turn as a user
    message built from the loop prompt.
-2. The model works. In a goal loop `loop_done` is exposed and does exactly one
-   thing: claim the goal is met, with a reason.
+2. The model works. `loop_next` ends the current iteration and starts the next
+   one; `loop_done` claims the goal is met, with a reason.
 3. When the model ends its turn with the loop still open, the extension
    advances it — the next iteration is dispatched as a hidden steer message.
    In forever loops the same turn-end injects a continuation instead, because
@@ -61,9 +64,29 @@ pi install git:github.com/hypernewbie/pi-loop-minimal
    phase: the next turn asks whether the goal has actually been reached, and
    only `loop_approve` is exposed then.
 
+### Iteration boundaries
+
+An iteration ends when the model calls `loop_next` **or** when its turn ends —
+whichever comes first. The two never count the same iteration twice: a turn
+end right after a `loop_next` hands the same iteration back instead of
+counting it again.
+
+```text
+loop_next(summary?)      # working phase: this iteration is done
+loop_done(reason)        # working phase: the goal is met (a claim)
+loop_approve(verdict, reason)   # check phase: the verdict
+```
+
+`loop_next` is only needed to move on without ending the turn — a turn end
+advances the loop anyway. It matters for count loops, where the model may
+want to chain several passes into one turn.
+
+Count semantics are strict: `/loop 3 …` runs **exactly** three iterations and
+completes itself after the third, whichever way each iteration ended. The
+model can also end it early with a confirmed claim.
+
 Goal loops are unbounded: they end when a claim is **confirmed**, or when the user
-stops them. There is no count form — a pass had no meaning once the model
-could no longer advance the loop itself.
+stops them.
 
 ## Forever loops
 
@@ -132,10 +155,10 @@ Exactly one loop tool is exposed at a time, and none when no loop runs:
 
 | State | Exposed |
 |---|---|
-| no loop | neither |
-| goal loop, working | `loop_done` |
-| goal loop, checking a claim | `loop_approve` |
-| forever loop | neither |
+| no loop | none |
+| loop, working | `loop_next`, `loop_done` |
+| loop, checking a claim | `loop_approve` |
+| forever loop | none |
 
 The active-tool list is derived from Pi's current list each time, so tool
 choices made by you or by other extensions are preserved. A `tool_call` gate
@@ -153,16 +176,18 @@ pass 3/5 · refine the renderer
 Ctrl+Shift+X to stop
 ```
 
-Footer status is `loop · iter 3` (goal mode), `loop · evaluating` (while a claim
-is being checked), or `loop · forever`. A tool result renders as
-`✓ loop complete` or `→ checking`; forever loops produce no tool result at
-all.
+Footer status is `loop · iter 3` (goal mode), `loop · pass 2/3` (count mode),
+`loop · evaluating` (while a claim is being checked), or `loop · forever`. A
+tool result renders as `✓ loop complete` or `→ checking`; forever loops produce
+no tool result at all.
 
 ## What changed from pi-agent-loop
 
-- **Minimal grammar**: `/loop goal` and `/loop forever <task>`. The original's
-  `passes <N>`, bare `<N>`, and `pipeline <s1|s2|s3>` grammar forms are gone
-  (the pipeline mode, `stages` field, and pipeline branches are deleted).
+- **Minimal grammar**: `/loop goal`, `/loop <N> <task>`, and
+  `/loop forever <task>`. The original's `passes <N>` and
+  `pipeline <s1|s2|s3>` grammar forms are gone (the count form survives,
+  respelled; the pipeline mode, `stages` field, and pipeline branches are
+  deleted).
 - **Current Pi API**: `@mariozechner/*` and `@sinclair/typebox` replaced with
   the `@earendil-works/*` packages and `typebox`; the dead
   `session_switch`/`session_fork` events and the no-op `agent_end` handler
@@ -189,11 +214,10 @@ all.
   ending the loop.
 - **Confirmation before closing**: a `loop_done` claim is checked in the next
   turn by `loop_approve`, and an unconfirmed claim resumes the loop instead of
-  closing it. Exactly one loop tool is exposed at a time.
-- **No count form**: `/loop <N> <task>` is gone. With the advance action
-  removed, a "pass" was only "one model turn", and a loop that ends when the
-  goal is met is the useful case. The command points at what is left instead
-  of failing cryptically.
+  closing it. Only the current phase's tools are exposed.
+- **The count form came back**: `/loop <N> <task>` runs exactly N iterations.
+  `loop_next` is the model-facing advance, and an iteration also ends when the
+  turn ends — the two never count the same iteration twice.
 - **Durable loop state**: state moved from tool-result details to explicit
   `loop-state` entries, because the model no longer produces a result per
   iteration. Legacy sessions that carry tool-result details still restore.
@@ -210,7 +234,7 @@ intentional exception: it has its own tool-free prompt and continuation.
 
 ```bash
 npm install
-npm test          # vitest — 136 tests
+npm test          # vitest — 167 tests
 npm run typecheck # tsc --noEmit (src + tests)
 npm pack --dry-run
 ```

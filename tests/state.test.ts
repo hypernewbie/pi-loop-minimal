@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	advanceState,
 	buildEvaluationPrompt,
 	buildNudgePrompt,
 	buildPrompt,
@@ -8,12 +9,14 @@ import {
 	getSystemPromptAddition,
 	parseForeverArgs,
 	parseGoalArgs,
+	parsePassesArgs,
 	updateWidget,
 } from "../src/state.ts";
 import type { LoopState } from "../src/state.ts";
 import {
 	captureUi,
 	claimingState,
+	countState,
 	foreverState,
 	goalState,
 	parseOk,
@@ -24,6 +27,7 @@ describe("emptyState", () => {
 		expect(emptyState()).toEqual({
 			active: false,
 			currentStep: 0,
+			maxSteps: null,
 			goal: "",
 			done: false,
 			reasonDone: "",
@@ -78,13 +82,89 @@ describe("parseForeverArgs", () => {
 	});
 });
 
+describe("parsePassesArgs", () => {
+	it("parses /loop <N> <task> with the count at parts[0]", () => {
+		const state = parseOk(parsePassesArgs(["3", "refine", "the", "renderer"]));
+		expect(state.active).toBe(true);
+		expect(state.maxSteps).toBe(3);
+		expect(state.goal).toBe("refine the renderer");
+		expect(state.forever).toBe(false);
+	});
+
+	it("accepts 1", () => {
+		expect(parseOk(parsePassesArgs(["1", "do", "it"])).maxSteps).toBe(1);
+	});
+
+	it("rejects 0 and negative counts", () => {
+		expect(parsePassesArgs(["0", "task"])).toBe(
+			"Provide a valid number of passes",
+		);
+		expect(parsePassesArgs(["-3", "task"])).toBe(
+			"Provide a valid number of passes",
+		);
+	});
+
+	it("rejects sloppy counts", () => {
+		expect(parsePassesArgs(["abc", "task"])).toBe(
+			"Provide a valid number of passes",
+		);
+		expect(parsePassesArgs(["3.5", "task"])).toBe(
+			"Provide a valid number of passes",
+		);
+		expect(parsePassesArgs(["3abc", "task"])).toBe(
+			"Provide a valid number of passes",
+		);
+	});
+
+	it("rejects a missing task", () => {
+		expect(parsePassesArgs(["3"])).toBe("Provide a task description");
+	});
+});
+
+describe("advanceState", () => {
+	it("counts one iteration for an unbounded loop", () => {
+		const s = advanceState(goalState(2));
+		expect(s.currentStep).toBe(3);
+		expect(s.active).toBe(true);
+		expect(s.done).toBe(false);
+	});
+
+	it("closes a count loop when the cap is reached", () => {
+		const s = advanceState(countState(2, 3));
+		expect(s.currentStep).toBe(3);
+		expect(s.active).toBe(false);
+		expect(s.done).toBe(true);
+		expect(s.reasonDone).toBe("Completed all passes");
+	});
+
+	it("keeps a count loop open below the cap", () => {
+		const s = advanceState(countState(0, 3));
+		expect(s.currentStep).toBe(1);
+		expect(s.active).toBe(true);
+	});
+});
+
 describe("buildPrompt", () => {
 	it("builds an open-ended goal iteration prompt", () => {
 		const p = buildPrompt(goalState());
 		expect(p).toContain("## Loop — Iteration 1");
 		expect(p).toContain("Goal: green tests");
-		expect(p).toContain("Each iteration ends when you end your turn");
+		expect(p).toContain("An iteration ends when you call loop_next or when you end your turn");
 		expect(p).toContain("call loop_done and give the reason why");
+	});
+
+	it("labels the count passes", () => {
+		const first = buildPrompt(countState(0, 3));
+		expect(first).toContain("## Loop — Pass 1 of 3");
+		expect(first).toContain("Task: task");
+		expect(first).toContain("This is the first pass.");
+		expect(first).toContain("A pass ends when you call loop_next or when you end your turn");
+		const mid = buildPrompt(countState(1, 3));
+		expect(mid).toContain("## Loop — Pass 2 of 3");
+		expect(mid).toContain("This is a refinement pass.");
+		const last = buildPrompt(countState(2, 3));
+		expect(last).toContain("## Loop — Pass 3 of 3");
+		expect(last).toContain("This is the **final pass**.");
 	});
 
 	it("offers the model no advance action in any prompt", () => {
@@ -147,6 +227,12 @@ describe("buildResumePrompt", () => {
 });
 
 describe("getSystemPromptAddition", () => {
+	it("shows the pass count for a count loop", () => {
+		const p = getSystemPromptAddition(countState(2, 7));
+		expect(p).toContain("Pass: 3/7");
+		expect(p).toContain("Call `loop_next` when this pass is complete.");
+	});
+
 	it("shows the goal and the iteration", () => {
 		const p = getSystemPromptAddition(goalState());
 		expect(p).toContain("Goal: green tests");
@@ -192,6 +278,13 @@ describe("updateWidget", () => {
 		updateWidget(goalState(), u.ctx);
 		expect(u.status).toBe("loop · iter 1");
 		expect(u.widget).toEqual(["iter 1 · green tests", "Ctrl+Shift+X to stop"]);
+	});
+
+	it("renders a compact pass label for a count loop", () => {
+		const u = captureUi();
+		updateWidget(countState(0, 5), u.ctx);
+		expect(u.status).toBe("loop · pass 1/5");
+		expect(u.widget).toEqual(["pass 1/5 · task", "Ctrl+Shift+X to stop"]);
 	});
 
 	it("advances the label with currentStep", () => {

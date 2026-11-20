@@ -12,12 +12,22 @@ export function goalState(step = 0): LoopState {
 	return {
 		active: true,
 		currentStep: step,
+		maxSteps: null,
 		goal: "green tests",
 		done: false,
 		reasonDone: "",
 		forever: false,
 		evaluating: false,
 		claimReason: "",
+	};
+}
+
+/** A count loop: exactly `max` iterations. */
+export function countState(step = 0, max = 3): LoopState {
+	return {
+		...goalState(step),
+		maxSteps: max,
+		goal: "task",
 	};
 }
 

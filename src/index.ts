@@ -20,6 +20,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import {
+	advanceState,
 	buildEvaluationPrompt,
 	buildNudgePrompt,
 	buildPrompt,
@@ -29,23 +30,31 @@ import {
 	type LoopState,
 	parseForeverArgs,
 	parseGoalArgs,
+	parsePassesArgs,
 	updateWidget,
 } from "./state.js";
 import {
 	getLoopApproveToolDefinition,
 	getLoopDoneToolDefinition,
+	getLoopNextToolDefinition,
 	handleLoopApproveTool,
 	handleLoopDoneTool,
+	handleLoopNextTool,
 	LOOP_APPROVE_TOOL,
 	LOOP_DONE_TOOL,
+	LOOP_NEXT_TOOL,
 	renderLoopApproveCall,
 	renderLoopApproveResult,
 	renderLoopDoneCall,
 	renderLoopDoneResult,
+	renderLoopNextCall,
 } from "./tool.js";
 
 export default function (pi: ExtensionAPI) {
 	let state = emptyState();
+	// Runtime-only: true when the model advanced the loop itself during the
+	// current run. A turn end must not count that iteration a second time.
+	let advancedThisRun = false;
 
 	const STATE_ENTRY = "loop-state";
 	const LEGACY_START_ENTRY = "loop-started";
@@ -55,14 +64,16 @@ export default function (pi: ExtensionAPI) {
 	// no longer advance a loop, so there is no tool result to reconstruct from.
 	const persist = (s: LoopState) => pi.appendEntry(STATE_ENTRY, { ...s });
 
-	// Exactly one loop tool is exposed at a time, and none when there is no
-	// loop to drive. Derive each change from Pi's current list: never restore
-	// a stale snapshot and accidentally overwrite tool choices made by the
-	// user or other extensions.
+	// The loop tools that belong to the current phase. Exactly the working
+	// tools are exposed while the model works, only the approval tool while a
+	// claim is checked, and none at all when there is no loop to drive.
 	const applyLoopTools = () => {
 		const tools = pi.getActiveTools();
 		const withoutLoopTools = tools.filter(
-			(name) => name !== LOOP_DONE_TOOL && name !== LOOP_APPROVE_TOOL,
+			(name) =>
+				name !== LOOP_DONE_TOOL &&
+				name !== LOOP_APPROVE_TOOL &&
+				name !== LOOP_NEXT_TOOL,
 		);
 		const wanted = !state.active
 			? []
@@ -70,7 +81,7 @@ export default function (pi: ExtensionAPI) {
 				? []
 				: state.evaluating
 					? [LOOP_APPROVE_TOOL]
-					: [LOOP_DONE_TOOL];
+					: [LOOP_NEXT_TOOL, LOOP_DONE_TOOL];
 		const next = [...withoutLoopTools, ...wanted];
 		if (next.length === tools.length && next.every((n, i) => n === tools[i])) {
 			return;
@@ -104,6 +115,10 @@ export default function (pi: ExtensionAPI) {
 			done: d.done === true,
 			reasonDone: typeof d.reasonDone === "string" ? d.reasonDone : "",
 			forever: d.forever === true,
+			maxSteps:
+				typeof d.maxSteps === "number" && Number.isFinite(d.maxSteps)
+					? d.maxSteps
+					: null,
 			// A pending check does not survive a restart: the claim it belonged
 			// to is dropped, and the loop goes back to working.
 			evaluating: false,
@@ -159,20 +174,20 @@ export default function (pi: ExtensionAPI) {
 	// Tool removal applies to future model requests. Block a call that was
 	// already issued by a stale/queued request before the removal took effect.
 	pi.on("tool_call", (event) => {
-		// Only the tool of the current phase may run. The active-tool list
-		// already hides the other one; this covers a call that was issued
+		// Only the tools of the current phase may run. The active-tool list
+		// already hides the others; this covers a call that was issued
 		// before the swap took effect.
-		if (event.toolName === LOOP_DONE_TOOL) {
+		if (event.toolName === LOOP_DONE_TOOL || event.toolName === LOOP_NEXT_TOOL) {
 			if (state.forever) {
 				return {
 					block: true,
-					reason: "loop_done is unavailable during a forever loop.",
+					reason: `${event.toolName} is unavailable during a forever loop.`,
 				};
 			}
 			if (state.evaluating) {
 				return {
 					block: true,
-					reason: "loop_done is unavailable while a completion claim is being checked.",
+					reason: `${event.toolName} is unavailable while a completion claim is being checked.`,
 				};
 			}
 		}
@@ -219,11 +234,41 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// The turn ended, so that iteration is over. The extension owns the
-		// boundary — the model cannot advance the loop itself.
-		state = { ...state, currentStep: state.currentStep + 1 };
+		// The turn ended. If the model already advanced the loop itself during
+		// this run, that iteration is counted — do not count it twice, just
+		// keep the loop working on the iteration it moved to.
+		if (advancedThisRun) {
+			advancedThisRun = false;
+			pi.sendMessage(
+				{
+					customType: "loop-nudge",
+					content: buildNudgePrompt(state),
+					display: false,
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
+			return;
+		}
+
+		// The turn ended without an explicit advance, so the iteration is over
+		// anyway: the extension owns the boundary.
+		state = advanceState(state);
 		persist(state);
 		updateWidget(state, ctx);
+		if (state.done) {
+			applyLoopTools();
+			pi.sendMessage({
+				customType: "loop-complete",
+				content: `✓ Loop complete — all ${state.maxSteps} passes done.`,
+				display: true,
+			});
+			return;
+		}
+		dispatchIteration(ctx);
+	});
+
+	// ── Dispatch the prompt for the iteration that is now running ───────
+	const dispatchIteration = (ctx: ExtensionContext) => {
 		pi.sendMessage(
 			{
 				customType: "loop-iteration",
@@ -232,7 +277,7 @@ export default function (pi: ExtensionAPI) {
 			},
 			{ triggerTurn: true, deliverAs: "steer" },
 		);
-	});
+	};
 
 	// ── Resume: the claim was not confirmed, so the loop keeps working ──
 	const resumeLoop = (why: string, ctx: ExtensionContext) => {
@@ -249,6 +294,36 @@ export default function (pi: ExtensionAPI) {
 			{ triggerTurn: true, deliverAs: "steer" },
 		);
 	};
+
+	// ── Tool: the LLM ends this iteration and starts the next one ───────
+	pi.registerTool({
+		...getLoopNextToolDefinition(),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const result = handleLoopNextTool(params, state);
+			state = result.newState;
+			if (result.details) {
+				persist(state);
+				advancedThisRun = true;
+				updateWidget(state, ctx);
+				applyLoopTools();
+				if (state.done) {
+					pi.sendMessage({
+						customType: "loop-complete",
+						content: result.content[0].text,
+						display: true,
+					});
+				} else {
+					dispatchIteration(ctx);
+				}
+			}
+			return {
+				content: result.content,
+				details: result.details,
+			};
+		},
+		renderCall: renderLoopNextCall,
+		renderResult: renderLoopDoneResult,
+	});
 
 	// ── Tool: the LLM claims the goal is met ───────────────────────────
 	pi.registerTool({
@@ -320,7 +395,7 @@ export default function (pi: ExtensionAPI) {
 	// ── /loop command — start a loop ─────────────────────────────────────
 	pi.registerCommand("loop", {
 		description:
-			"Start a loop. Usage: /loop goal <desc> | /loop forever <task>",
+			"Start a loop. Usage: /loop goal <desc> | /loop forever <task> | /loop <N> <task>",
 		getArgumentCompletions: (prefix: string) => {
 			// Filter by the current argument: once the user types the goal
 			// text, the completion must disappear so accepting it cannot
@@ -344,7 +419,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!args?.trim()) {
 				ctx.ui.notify(
-					"Usage:\n  /loop goal <description>\n  /loop forever <task>",
+					"Usage:\n  /loop goal <description>\n  /loop forever <task>\n  /loop <N> <task>",
 					"info",
 				);
 				return;
@@ -361,15 +436,11 @@ export default function (pi: ExtensionAPI) {
 				result = parseGoalArgs(parts);
 			} else if (mode === "forever") {
 				result = parseForeverArgs(parts);
-			} else if (/^\d+$/.test(mode) || mode === "passes") {
-				ctx.ui.notify(
-					"Exact-count loops were removed. Use /loop goal <description> (ends when the goal is met) or /loop forever <task> (ends when you stop it).",
-					"error",
-				);
-				return;
+			} else if (/^\d+$/.test(mode)) {
+				result = parsePassesArgs(parts);
 			} else {
 				ctx.ui.notify(
-					`Unknown mode "${mode}". Use: goal or forever`,
+					`Unknown mode "${mode}". Use: goal, forever, or <N> for an exact-count loop`,
 					"error",
 				);
 				return;
@@ -381,7 +452,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			state = result;
-			// Exactly one loop tool is exposed, and only while a loop runs.
+			advancedThisRun = false;
+			// Exactly the working tools are exposed, and only while a loop runs.
 			applyLoopTools();
 			persist(state);
 			updateWidget(state, ctx);

@@ -26,7 +26,7 @@ function harness() {
 	const sentUser: string[] = [];
 	const sent: { msg: { content?: string; customType?: string; display?: boolean }; opts: unknown }[] = [];
 	// Registered tools are active by default, so both loop tools start here.
-	const activeTools = ["read", "bash", "loop_done", "loop_approve"];
+	const activeTools = ["read", "bash", "loop_done", "loop_approve", "loop_next"];
 	const ui = { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() };
 	const ctx = {
 		ui,
@@ -60,6 +60,8 @@ function harness() {
 		toolDefs.find((t) => t.name === "loop_done")!.execute("c", p, undefined, undefined, ctx);
 	const approve = (p: ToolParams) =>
 		toolDefs.find((t) => t.name === "loop_approve")!.execute("c", p, undefined, undefined, ctx);
+	const next = (p: ToolParams) =>
+		toolDefs.find((t) => t.name === "loop_next")!.execute("c", p, undefined, undefined, ctx);
 	// A normal turn end: the model finished and stopped.
 	const turnEnd = (stopReason = "stop") =>
 		handlers.get("agent_end")!(
@@ -71,6 +73,7 @@ function harness() {
 		commands,
 		tool,
 		approve,
+		next,
 		sent,
 		sentUser,
 		ui,
@@ -146,6 +149,32 @@ describe("goal loop lifecycle", () => {
 	});
 });
 
+describe("count loop lifecycle", () => {
+	it("/loop 3 runs exactly three passes, then completes", async () => {
+		const h = harness();
+		await h.commands.get("loop")!.handler("3 polish", h.ctx);
+		expect(h.sentUser[0]).toContain("## Loop — Pass 1 of 3");
+
+		await h.turnEnd();
+		expect(h.sent.find((m) => m.msg.customType === "loop-iteration")?.msg.content).toContain(
+			"## Loop — Pass 2 of 3",
+		);
+		await h.turnEnd();
+		await h.turnEnd();
+		const done = h.sent.find((m) => m.msg.customType === "loop-complete");
+		expect(done?.msg.content).toContain("all 3 passes done");
+	});
+
+	it("an explicit advance closes a pass without ending the turn", async () => {
+		const h = harness();
+		await h.commands.get("loop")!.handler("3 polish", h.ctx);
+		await h.next({ summary: "pass one" });
+		expect(h.sent.find((m) => m.msg.customType === "loop-iteration")?.msg.content).toContain(
+			"## Loop — Pass 2 of 3",
+		);
+	});
+});
+
 describe("cross-surface consistency", () => {
 	it("keeps widget, steer prompt, and iteration number in lockstep", async () => {
 		const h = harness();
@@ -166,17 +195,21 @@ describe("cross-surface consistency", () => {
 		expect(JSON.parse(JSON.stringify(r.details))).toEqual(r.details);
 	});
 
-	it("exposes exactly one loop tool at a time", async () => {
+	it("exposes only the tools of the current phase", async () => {
 		const h = harness();
 		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_next");
 		await h.commands.get("loop")!.handler("goal x", h.ctx);
 		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 		await h.tool({ reason: "claiming" });
 		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_next");
 		expect(h.activeTools()).toContain("loop_approve");
 		await h.approve({ verdict: "reached", reason: "verified" });
 		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 	});
 });

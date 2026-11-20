@@ -24,6 +24,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 export interface LoopState {
 	active: boolean;
 	currentStep: number; // completed iterations
+	maxSteps: number | null; // null = unbounded (goal/forever), N for a count loop
 	goal: string; // User's description of what we're doing
 	done: boolean; // the loop was closed
 	reasonDone: string; // Why the loop stopped
@@ -40,6 +41,7 @@ export function emptyState(): LoopState {
 	return {
 		active: false,
 		currentStep: 0,
+		maxSteps: null,
 		goal: "",
 		done: false,
 		reasonDone: "",
@@ -49,9 +51,40 @@ export function emptyState(): LoopState {
 	};
 }
 
+// One iteration boundary. A count loop closes when the cap is reached;
+// every other loop keeps going.
+export function advanceState(state: LoopState): LoopState {
+	const completed = state.currentStep + 1;
+	if (state.maxSteps !== null && completed >= state.maxSteps) {
+		return {
+			...state,
+			currentStep: completed,
+			done: true,
+			active: false,
+			reasonDone: "Completed all passes",
+		};
+	}
+	return { ...state, currentStep: completed };
+}
+
 // Build the steer message for the current iteration
 export function buildPrompt(state: LoopState): string {
 	const step = state.currentStep;
+
+	if (state.maxSteps !== null) {
+		const max = state.maxSteps;
+		return [
+			`## Loop — Pass ${step + 1} of ${max}`,
+			`Task: ${state.goal}`,
+			step === 0
+				? `This is the first pass. Do an initial implementation/analysis.`
+				: step < max - 1
+					? `This is a refinement pass. Review and improve on the previous pass.`
+					: `This is the **final pass**. Do a final polish.`,
+			`\nA pass ends when you call loop_next or when you end your turn.`,
+			`If the goal is fully met earlier, call loop_done and give the reason why.`,
+		].join("\n");
+	}
 
 	if (state.forever) {
 		return [
@@ -67,7 +100,7 @@ export function buildPrompt(state: LoopState): string {
 		`## Loop — Iteration ${step + 1}`,
 		`Goal: ${state.goal}`,
 		`Work toward the goal.`,
-		`Each iteration ends when you end your turn — the loop continues automatically.`,
+		`An iteration ends when you call loop_next or when you end your turn — the loop continues automatically.`,
 		`When the goal is fully met, call loop_done and give the reason why.`,
 	].join("\n");
 }
@@ -112,7 +145,32 @@ export function parseGoalArgs(parts: string[]): LoopState | string {
 	return {
 		active: true,
 		currentStep: 0,
+		maxSteps: null,
 		goal,
+		done: false,
+		reasonDone: "",
+		forever: false,
+		evaluating: false,
+		claimReason: "",
+	};
+}
+
+// /loop <N> <task> — exactly N iterations
+export function parsePassesArgs(parts: string[]): LoopState | string {
+	// parts[0] is the count: /loop <N> <task>
+	const n = Number(parts[0]);
+	if (!Number.isInteger(n) || n < 1) {
+		return "Provide a valid number of passes";
+	}
+	const task = parts.slice(1).join(" ");
+	if (!task) {
+		return "Provide a task description";
+	}
+	return {
+		active: true,
+		currentStep: 0,
+		maxSteps: n,
+		goal: task,
 		done: false,
 		reasonDone: "",
 		forever: false,
@@ -130,6 +188,7 @@ export function parseForeverArgs(parts: string[]): LoopState | string {
 	return {
 		active: true,
 		currentStep: 0,
+		maxSteps: null,
 		goal: task,
 		done: false,
 		reasonDone: "",
@@ -140,13 +199,24 @@ export function parseForeverArgs(parts: string[]): LoopState | string {
 }
 
 // Continuation message for a forever loop: the model ended its turn, the work
-// session stays open. Forever loops have no iteration counter — the same
-// turn-end drives both the goal advance and this continuation.
+// session stays open. For a goal or count loop the same message keeps the
+// current iteration going after the model advanced the loop itself.
 export function buildNudgePrompt(state: LoopState): string {
+	if (state.forever) {
+		return [
+			"The forever loop remains active.",
+			`Continue working on: ${state.goal}`,
+			"Only the user can stop this work session.",
+		].join("\n");
+	}
+
+	const label =
+		state.maxSteps !== null
+			? `pass ${state.currentStep + 1}/${state.maxSteps}`
+			: `iteration ${state.currentStep + 1}`;
 	return [
-		"The forever loop remains active.",
+		`The loop is still active — ${label}.`,
 		`Continue working on: ${state.goal}`,
-		"Only the user can stop this work session.",
 	].join("\n");
 }
 
@@ -178,7 +248,10 @@ export function updateWidget(state: LoopState, ctx: ExtensionContext) {
 		return;
 	}
 
-	const label = `iter ${state.currentStep + 1}`;
+	const label =
+		state.maxSteps !== null
+			? `pass ${state.currentStep + 1}/${state.maxSteps}`
+			: `iter ${state.currentStep + 1}`;
 
 	ctx.ui.setStatus("loop", `loop · ${label}`);
 	ctx.ui.setWidget("loop", [
@@ -209,6 +282,18 @@ export function getSystemPromptAddition(state: LoopState): string {
 		].join("\n");
 	}
 
+	if (state.maxSteps !== null) {
+		return [
+			"",
+			"",
+			"## Active Loop",
+			`Goal: ${state.goal}`,
+			`Pass: ${state.currentStep + 1}/${state.maxSteps}`,
+			"Call `loop_next` when this pass is complete.",
+			"Call `loop_done` only when the goal is fully met — a claim is confirmed in a follow-up check before the loop closes.",
+		].join("\n");
+	}
+
 	return [
 		"",
 		"",
@@ -216,6 +301,7 @@ export function getSystemPromptAddition(state: LoopState): string {
 		`Goal: ${state.goal}`,
 		`Iteration: ${state.currentStep + 1}`,
 		"The loop advances automatically when you end your turn.",
+		"Call `loop_next` to end this iteration and start the next one.",
 		"Call `loop_done` only when the goal is fully met — a claim is confirmed in a follow-up check before the loop closes.",
 	].join("\n");
 }

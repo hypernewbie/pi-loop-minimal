@@ -19,10 +19,11 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type { LoopState } from "./state.js";
+import { advanceState, type LoopState } from "./state.js";
 
 export const LOOP_DONE_TOOL = "loop_done";
 export const LOOP_APPROVE_TOOL = "loop_approve";
+export const LOOP_NEXT_TOOL = "loop_next";
 
 export interface LoopDoneParams {
 	reason?: string;
@@ -31,6 +32,10 @@ export interface LoopDoneParams {
 export interface LoopApproveParams {
 	verdict?: "reached" | "not_reached";
 	reason?: string;
+}
+
+export interface LoopNextParams {
+	summary?: string;
 }
 
 export interface ToolOutcome {
@@ -194,6 +199,67 @@ export function handleLoopApproveTool(
 	};
 }
 
+/**
+ * The model ends the current iteration and starts the next one. A count loop
+ * closes when it reaches its cap; every other loop keeps going.
+ */
+export function handleLoopNextTool(
+	params: LoopNextParams,
+	state: LoopState,
+): ToolOutcome {
+	if (!state.active) {
+		return {
+			content: [
+				{ type: "text", text: "No active loop. Start one with /loop." },
+			],
+			details: undefined,
+			newState: state,
+		};
+	}
+
+	if (state.forever) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: "loop_next is unavailable during a forever loop.",
+				},
+			],
+			details: undefined,
+			newState: state,
+		};
+	}
+
+	// A stale advance while a claim is being checked must not replace it.
+	if (state.evaluating) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: "A completion claim is being checked. Wait for its verdict.",
+				},
+			],
+			details: undefined,
+			newState: state,
+		};
+	}
+
+	const newState = advanceState(state);
+	const summary = (params.summary ?? "").trim();
+	return {
+		content: [
+			{
+				type: "text",
+				text: newState.done
+					? `✓ Loop complete — all ${state.maxSteps} passes done.`
+					: `→ Continuing to iteration ${newState.currentStep + 1}.${summary ? ` Summary: ${summary}` : ""}`,
+			},
+		],
+		details: { ...newState } as LoopState,
+		newState,
+	};
+}
+
 export function getLoopDoneToolDefinition() {
 	return {
 		name: LOOP_DONE_TOOL,
@@ -242,6 +308,43 @@ export function getLoopApproveToolDefinition() {
 			}),
 		}),
 	};
+}
+
+export function getLoopNextToolDefinition() {
+	return {
+		name: LOOP_NEXT_TOOL,
+		label: "Loop Next",
+		description: [
+			"End this iteration and start the next one.",
+			"An iteration also ends when you end your turn, so this is only needed to move on without ending the turn.",
+			"summary: what was accomplished in this iteration (optional).",
+		].join(" "),
+		parameters: Type.Object({
+			summary: Type.Optional(
+				Type.String({
+					description: "What was accomplished in this iteration",
+				}),
+			),
+		}),
+	};
+}
+
+export function renderLoopNextCall(
+	args: { summary?: string },
+	theme: unknown,
+) {
+	const t = theme as {
+		fg: (k: string, s: string) => string;
+		bold: (s: string) => string;
+	};
+	const summary = (args.summary ?? "").trim();
+	const shown = summary.length > 60 ? `${summary.slice(0, 57)}…` : summary;
+	return new Text(
+		t.fg("toolTitle", t.bold("loop_next ")) +
+			t.fg("accent", shown || "(no summary)"),
+		0,
+		0,
+	);
 }
 
 export function renderLoopDoneCall(args: { reason?: string }, theme: unknown) {

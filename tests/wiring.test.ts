@@ -4,7 +4,7 @@ import extension from "../src/index.ts";
 import type { LoopState } from "../src/state.ts";
 import { foreverState } from "./helpers.ts";
 
-type ToolParams = { reason?: string; verdict?: string };
+type ToolParams = { reason?: string; verdict?: string; summary?: string };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: LoopState };
 type CommandCtx = ExtensionContext & { waitForIdle(): Promise<void> };
 type CommandDef = {
@@ -113,6 +113,10 @@ async function execApprove(h: Harness, params: ToolParams): Promise<ToolResult> 
 	return approveTool(h).execute("call-2", params, undefined, undefined, h.ctx);
 }
 
+async function execNext(h: Harness, params: ToolParams): Promise<ToolResult> {
+	return nextTool(h).execute("call-3", params, undefined, undefined, h.ctx);
+}
+
 /** A normal turn end: the model finished and stopped. */
 async function turnEnd(
 	h: Harness,
@@ -125,6 +129,7 @@ async function turnEnd(
 }
 
 const doneTool = (h: Harness) => h.toolDefs.find((t) => t.name === "loop_done")!;
+const nextTool = (h: Harness) => h.toolDefs.find((t) => t.name === "loop_next")!;
 const approveTool = (h: Harness) =>
 	h.toolDefs.find((t) => t.name === "loop_approve")!;
 
@@ -146,7 +151,11 @@ describe("extension surface", () => {
 		expect(h.commands.has("loop")).toBe(true);
 		expect(h.commands.has("loop-stop")).toBe(true);
 		expect(h.shortcuts.has("ctrl+shift+x")).toBe(true);
-		expect(h.toolDefs.map((t) => t.name)).toEqual(["loop_done", "loop_approve"]);
+		expect(h.toolDefs.map((t) => t.name)).toEqual([
+			"loop_next",
+			"loop_done",
+			"loop_approve",
+		]);
 	});
 
 	it("listens only to current-Pi events", () => {
@@ -191,7 +200,7 @@ describe("/loop command", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			"Usage:\n  /loop goal <description>\n  /loop forever <task>",
+			"Usage:\n  /loop goal <description>\n  /loop forever <task>\n  /loop <N> <task>",
 			"info",
 		);
 		expect(h.sentUserMessages).toHaveLength(0);
@@ -209,21 +218,23 @@ describe("/loop command", () => {
 		]);
 	});
 
-	it("rejects the removed exact-count form with a pointer to what is left", async () => {
+	it("starts an exact-count loop with /loop <N> <task>", async () => {
 		const h = createHarness();
 		await loopCmd(h).handler("5 refine the renderer", h.ctx);
-		expect(h.ui.notify).toHaveBeenCalledWith(
-			"Exact-count loops were removed. Use /loop goal <description> (ends when the goal is met) or /loop forever <task> (ends when you stop it).",
-			"error",
-		);
-		expect(h.sentUserMessages).toHaveLength(0);
+		expect(h.sentUserMessages).toHaveLength(1);
+		expect(h.sentUserMessages[0]).toContain("## Loop — Pass 1 of 5");
+		expect(h.sentUserMessages[0]).toContain("Task: refine the renderer");
+		expect(h.ui.setWidget).toHaveBeenCalledWith("loop", [
+			"pass 1/5 · refine the renderer",
+			"Ctrl+Shift+X to stop",
+		]);
 	});
 
 	it("rejects the legacy passes word", async () => {
 		const h = createHarness();
 		await loopCmd(h).handler("passes 3 refine", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			"Exact-count loops were removed. Use /loop goal <description> (ends when the goal is met) or /loop forever <task> (ends when you stop it).",
+			'Unknown mode "passes". Use: goal, forever, or <N> for an exact-count loop',
 			"error",
 		);
 		expect(h.sentUserMessages).toHaveLength(0);
@@ -233,16 +244,16 @@ describe("/loop command", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("pipeline a|b do stuff", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			'Unknown mode "pipeline". Use: goal or forever',
+			'Unknown mode "pipeline". Use: goal, forever, or <N> for an exact-count loop',
 			"error",
 		);
 	});
 
-	it("rejects a zero count the same way", async () => {
+	it("rejects a zero count with the parser message", async () => {
 		const h = createHarness();
 		await loopCmd(h).handler("0 task", h.ctx);
 		expect(h.ui.notify).toHaveBeenCalledWith(
-			"Exact-count loops were removed. Use /loop goal <description> (ends when the goal is met) or /loop forever <task> (ends when you stop it).",
+			"Provide a valid number of passes",
 			"error",
 		);
 	});
@@ -287,9 +298,11 @@ describe("loop_done claims completion", () => {
 		const h = createHarness();
 		await loopCmd(h).handler("goal win", h.ctx);
 		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 		await execTool(h, { reason: "all tests pass" });
 		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_next");
 		expect(h.activeTools()).toContain("loop_approve");
 	});
 
@@ -304,6 +317,7 @@ describe("loop_done claims completion", () => {
 		expect(h.ui.setWidget).toHaveBeenLastCalledWith("loop", undefined);
 		// no loop tool is exposed once the loop is over
 		expect(h.activeTools()).not.toContain("loop_done");
+		expect(h.activeTools()).not.toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 	});
 
@@ -316,8 +330,9 @@ describe("loop_done claims completion", () => {
 		expect(resumes(h)).toHaveLength(1);
 		expect(resumes(h)[0].msg.content).toContain("the build fails");
 		expect(resumes(h)[0].msg.content).toContain("Keep working on the goal");
-		// the work tool comes back, the approval tool goes away
+		// the work tools come back, the approval tool goes away
 		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 	});
 
@@ -340,6 +355,7 @@ describe("loop_done claims completion", () => {
 		expect(resumes(h)).toHaveLength(1);
 		expect(resumes(h)[0].msg.content).toContain("the claim was not confirmed");
 		expect(h.activeTools()).toContain("loop_done");
+		expect(h.activeTools()).toContain("loop_next");
 		expect(h.activeTools()).not.toContain("loop_approve");
 	});
 
@@ -720,9 +736,16 @@ describe("/loop forever", () => {
 		await loopCmd(h).handler("forever tidy up", h.ctx);
 		h.setTools(["read", "unrelated_tool", "user_added_tool"]);
 		await loopCmd(h).handler("goal x", h.ctx);
-		expect(h.activeTools()).toEqual(["read", "unrelated_tool", "user_added_tool", "loop_done"]);
+		expect(h.activeTools()).toEqual([
+			"read",
+			"unrelated_tool",
+			"user_added_tool",
+			"loop_next",
+			"loop_done",
+		]);
 		await loopCmd(h).handler("3 x", h.ctx);
 		expect(h.activeTools().filter((name) => name === "loop_done")).toHaveLength(1);
+		expect(h.activeTools().filter((name) => name === "loop_next")).toHaveLength(1);
 	});
 });
 
@@ -821,12 +844,134 @@ describe("before_agent_start", () => {
 	});
 });
 
+describe("loop_next advances the iteration", () => {
+	it("advances and dispatches the next iteration", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal keep going", h.ctx);
+		const r = await execNext(h, { summary: "half done" });
+		expect(r.details).toMatchObject({ currentStep: 1, active: true });
+		expect(r.content[0].text).toContain("Continuing to iteration 2");
+		expect(iterations(h)).toHaveLength(1);
+		expect(iterations(h)[0].msg.content).toContain("## Loop — Iteration 2");
+		expect(h.ui.setWidget).toHaveBeenLastCalledWith("loop", [
+			"iter 2 · keep going",
+			"Ctrl+Shift+X to stop",
+		]);
+	});
+
+	it("does not count the same iteration again when the turn ends", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal keep going", h.ctx);
+		await execNext(h, { summary: "half done" });
+		await turnEnd(h);
+		// one advance only: the model already closed that iteration
+		expect(iterations(h)).toHaveLength(1);
+		expect(h.ui.setStatus).toHaveBeenLastCalledWith("loop", "loop · iter 2");
+		// the loop keeps working instead of stalling
+		expect(nudges(h)).toHaveLength(1);
+		expect(nudges(h)[0].msg.content).toContain("The loop is still active");
+	});
+
+	it("advances again on the next turn end", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal keep going", h.ctx);
+		await execNext(h, { summary: "half done" });
+		await turnEnd(h);
+		await turnEnd(h);
+		expect(iterations(h)).toHaveLength(2);
+		expect(iterations(h)[1].msg.content).toContain("## Loop — Iteration 3");
+	});
+
+	it("is blocked while a claim is being checked", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("goal x", h.ctx);
+		await execTool(h, { reason: "claiming" });
+		const blocked = h.handlers.get("tool_call")!(
+			{ toolName: "loop_next" },
+			h.ctx,
+		);
+		expect(blocked).toEqual({
+			block: true,
+			reason: "loop_next is unavailable while a completion claim is being checked.",
+		});
+	});
+});
+
+describe("count loops", () => {
+	it("runs exactly N iterations and completes on the last one", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("3 polish", h.ctx);
+		expect(h.sentUserMessages[0]).toContain("## Loop — Pass 1 of 3");
+
+		await turnEnd(h);
+		expect(iterations(h)[0].msg.content).toContain("## Loop — Pass 2 of 3");
+		await turnEnd(h);
+		expect(iterations(h)[1].msg.content).toContain("## Loop — Pass 3 of 3");
+		await turnEnd(h);
+
+		const done = h.sentMessages.find((m) => m.msg.customType === "loop-complete");
+		expect(done?.msg.content).toContain("all 3 passes done");
+		expect(h.ui.setWidget).toHaveBeenLastCalledWith("loop", undefined);
+		expect(h.activeTools()).not.toContain("loop_next");
+		expect(h.activeTools()).not.toContain("loop_done");
+	});
+
+	it("counts an explicit advance and a turn end as separate passes", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("3 polish", h.ctx);
+		// pass 1 is closed by the model
+		await execNext(h, { summary: "pass one" });
+		expect(h.ui.setStatus).toHaveBeenLastCalledWith("loop", "loop · pass 2/3");
+		// the turn end right after it must not count the same pass twice
+		await turnEnd(h);
+		expect(h.ui.setStatus).toHaveBeenLastCalledWith("loop", "loop · pass 2/3");
+		// the next turn end closes pass 2
+		await turnEnd(h);
+		expect(h.ui.setStatus).toHaveBeenLastCalledWith("loop", "loop · pass 3/3");
+		// and the one after that closes pass 3, which is the last one
+		await turnEnd(h);
+		const done = h.sentMessages.find((m) => m.msg.customType === "loop-complete");
+		expect(done?.msg.content).toContain("all 3 passes done");
+	});
+
+	it("never runs more than N passes", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("2 polish", h.ctx);
+		await execNext(h, { summary: "one" });
+		await execNext(h, { summary: "two" });
+		await execNext(h, { summary: "three" });
+		const done = h.sentMessages.find((m) => m.msg.customType === "loop-complete");
+		expect(done?.msg.content).toContain("all 2 passes done");
+		expect(h.sentMessages.filter((m) => m.msg.customType === "loop-complete")).toHaveLength(1);
+	});
+
+	it("completes early when a claim is confirmed", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("3 polish", h.ctx);
+		await execTool(h, { reason: "already good enough" });
+		await execApprove(h, { verdict: "reached", reason: "verified" });
+		const r = await execNext(h, { summary: "x" });
+		expect(r.content[0].text).toBe("No active loop. Start one with /loop.");
+	});
+
+	it("shows the pass counter in the widget", async () => {
+		const h = createHarness();
+		await loopCmd(h).handler("3 polish", h.ctx);
+		expect(h.ui.setStatus).toHaveBeenLastCalledWith("loop", "loop · pass 1/3");
+		expect(h.ui.setWidget).toHaveBeenLastCalledWith("loop", [
+			"pass 1/3 · polish",
+			"Ctrl+Shift+X to stop",
+		]);
+	});
+});
+
 describe("tool exposure", () => {
 	it("exposes no loop tool before a loop starts", async () => {
 		const h = createHarness();
 		await h.handlers.get("session_start")!({}, h.ctx);
 		expect(h.activeTools()).not.toContain("loop_done");
 		expect(h.activeTools()).not.toContain("loop_approve");
+		expect(h.activeTools()).not.toContain("loop_next");
 	});
 
 	it("exposes no loop tool once the loop is over", async () => {
@@ -838,6 +983,7 @@ describe("tool exposure", () => {
 		await execApprove(h, { verdict: "reached", reason: "verified" });
 		expect(h.activeTools()).not.toContain("loop_done");
 		expect(h.activeTools()).not.toContain("loop_approve");
+		expect(h.activeTools()).not.toContain("loop_next");
 	});
 
 	it("exposes no loop tool after /loop-stop", async () => {
@@ -847,6 +993,7 @@ describe("tool exposure", () => {
 		await stopCmd(h).handler("", h.ctx);
 		expect(h.activeTools()).not.toContain("loop_done");
 		expect(h.activeTools()).not.toContain("loop_approve");
+		expect(h.activeTools()).not.toContain("loop_next");
 	});
 
 	it("exposes no loop tool for a forever loop", async () => {
@@ -855,6 +1002,7 @@ describe("tool exposure", () => {
 		await loopCmd(h).handler("forever x", h.ctx);
 		expect(h.activeTools()).not.toContain("loop_done");
 		expect(h.activeTools()).not.toContain("loop_approve");
+		expect(h.activeTools()).not.toContain("loop_next");
 	});
 
 	it("drops a pending claim when the session is restored", async () => {
@@ -884,7 +1032,7 @@ describe("tool exposure", () => {
 });
 
 describe("session reconstruction", () => {
-	it("restores a legacy count loop as an unbounded goal loop", async () => {
+	it("restores a legacy count loop as a count loop", async () => {
 		const h = createHarness();
 		h.branch.push({
 			type: "message",
@@ -904,9 +1052,7 @@ describe("session reconstruction", () => {
 		});
 		await h.handlers.get("session_start")!({}, h.ctx);
 		await turnEnd(h);
-		// the count cap is gone: the restored loop is an open goal loop
-		expect(iterations(h)[0].msg.content).toContain("## Loop — Iteration 3");
-		expect(iterations(h)[0].msg.content).not.toContain("Pass");
+		expect(iterations(h)[0].msg.content).toContain("## Loop — Pass 3 of 4");
 	});
 
 	it("restores an active loop from a state entry", async () => {
